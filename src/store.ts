@@ -1,12 +1,14 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { conversationFacts, indexConversation, rewriteQuery, SEMANTIC_VERSION, type ActiveWindow, type JsonModel, type TopicVocabulary } from "./semantic";
+import { conversationFacts, indexConversation, rewriteQuery, SEMANTIC_VERSION, type ActiveWindow, type ConversationFacts, type ConversationIndex, type JsonModel, type TopicVocabulary } from "./semantic";
 import { canonicalPath, digest, evidencePage, loadSource, RecallError, redactJson, type SessionSource, type SourceEntry } from "./source";
 import { timeRange, type TimeFilter, type TimeRange } from "./time";
 import type { ModelMetric } from "./omp-model";
+import { openHistoryDatabase } from "./database";
+import { validateConcurrency } from "./concurrency";
 
 type Job = { file: string; stamp: string; attempts: number; token: string };
 type ConversationRow = {
@@ -16,7 +18,30 @@ type ConversationRow = {
   active_windows: string; size: number; model: string;
 };
 type TopicRow = { id: string; title: string; description: string; aliases: string };
+type CatalogEntry = {
+  file: string; file_name: string; indexed: boolean; conversation_id: string | null;
+  session_id: string | null; title: string | null; description: string | null;
+  started_at: string; last_active_at: string; size_bytes: number; mtime_ms: number;
+};
 export type BrowseOptions = TimeFilter & { topic_id?: string; cursor?: string; limit?: number };
+export type IndexResult = { completed: number; failed: number; calls: number; errors: { file: string; code: string }[] };
+
+function browseCursor(value: string, binding: string): { offset: number; range: TimeRange } {
+  try {
+    if (value.length > 512) throw new Error();
+    const cursor: unknown = JSON.parse(Buffer.from(value, "base64url").toString());
+    if (!cursor || typeof cursor !== "object" || !("b" in cursor) || cursor.b !== binding
+      || !("o" in cursor) || typeof cursor.o !== "number" || !Number.isSafeInteger(cursor.o) || cursor.o < 0
+      || !("r" in cursor) || !cursor.r || typeof cursor.r !== "object") throw new Error();
+    const range = cursor.r;
+    if (!("from" in range) || !("to" in range)
+      || (range.from !== null && typeof range.from !== "string")
+      || (range.to !== null && typeof range.to !== "string")) throw new Error();
+    return { offset: cursor.o, range: timeRange({ from: range.from ?? undefined, to: range.to ?? undefined }) };
+  } catch {
+    throw new RecallError("stale_cursor", "Directory changed, filters differ, or cursor is invalid; restart without a cursor.");
+  }
+}
 
 function searchTerms(text: string): string[] {
   const normalized = text.normalize("NFKC").toLowerCase();
@@ -52,14 +77,13 @@ function conversationPresentation(row: ConversationRow) {
   };
 }
 
-function topicPresentation(topic: TopicRow, conversations: ConversationRow[]) {
-  const ordered = [...conversations].sort((a, b) => b.last_active_at.localeCompare(a.last_active_at));
-  const latest = ordered.slice(0, 3).map(row => `${row.title}: ${row.summary}`).join(" / ");
-  const span = conversations.length
-    ? `${formatDate(conversations.map(row => row.started_at).sort().at(0)!)} to ${conversations.map(row => row.last_active_at).sort().at(-1)!}`
-    : "no indexed activity";
+function topicPresentation(topic: TopicRow, newestFirst: readonly ConversationRow[]) {
+  const latest = newestFirst.slice(0, 3).map(row => `${row.title}: ${row.summary}`).join(" / ");
+  let earliest = newestFirst[0]?.started_at;
+  for (const row of newestFirst) if (!earliest || row.started_at < earliest) earliest = row.started_at;
+  const span = earliest ? `${formatDate(earliest)} to ${newestFirst[0].last_active_at}` : "no indexed activity";
   return { id: topic.id, title: topic.title,
-    description: `${topic.description} Timeline: ${span} across ${conversations.length} conversation(s).${latest ? ` Latest: ${latest}` : ""}`,
+    description: `${topic.description} Timeline: ${span} across ${newestFirst.length} conversation(s).${latest ? ` Latest: ${latest}` : ""}`,
     aliases: JSON.parse(topic.aliases) as string[] };
 }
 
@@ -72,60 +96,14 @@ export class HistoryStore {
   constructor(readonly dbPath: string, project: string, excludedSessionId?: string) {
     try { this.project = realpathSync(project); } catch { this.project = path.resolve(project); }
     this.excludedSessionId = excludedSessionId;
-    mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-    this.db = new Database(dbPath);
-    chmodSync(dbPath, 0o600);
-    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
-    const version = this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-    if (version !== 0 && version !== 3) {
-      this.db.close();
-      throw new RecallError("unsupported_index", "This plugin uses a new explicit conversation/topic index; delete the old database.");
-    }
-    if (version === 3) return;
-    this.db.transaction(() => {
-      this.db.exec(`
-        CREATE TABLE hr_topics (
-          project TEXT NOT NULL,id TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,aliases TEXT NOT NULL,
-          created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(project,id)
-        );
-        CREATE TABLE hr_conversations (
-          id TEXT PRIMARY KEY,project TEXT NOT NULL,session_id TEXT NOT NULL,file TEXT NOT NULL,directory TEXT NOT NULL,
-          stamp TEXT NOT NULL,source_project TEXT NOT NULL,unprojected INTEGER NOT NULL,source_hash TEXT NOT NULL,
-          title TEXT NOT NULL,summary TEXT NOT NULL,started_at TEXT NOT NULL,last_active_at TEXT NOT NULL,
-          entry_count INTEGER NOT NULL,message_count INTEGER NOT NULL,user_turn_count INTEGER NOT NULL,
-          branch_count INTEGER NOT NULL,active_windows TEXT NOT NULL,size INTEGER NOT NULL,model TEXT NOT NULL,
-          indexed_at TEXT NOT NULL,UNIQUE(project,session_id),UNIQUE(project,file)
-        );
-        CREATE TABLE hr_conversation_topics (
-          project TEXT NOT NULL,topic_id TEXT NOT NULL,
-          conversation_id TEXT NOT NULL REFERENCES hr_conversations(id) ON DELETE CASCADE,
-          PRIMARY KEY(conversation_id,topic_id),FOREIGN KEY(project,topic_id) REFERENCES hr_topics(project,id)
-        );
-        CREATE TABLE hr_entries (
-          id TEXT PRIMARY KEY,project TEXT NOT NULL,
-          conversation_id TEXT NOT NULL REFERENCES hr_conversations(id) ON DELETE CASCADE,
-          entry_id TEXT NOT NULL,parent_id TEXT,timestamp TEXT NOT NULL,role TEXT NOT NULL,line INTEGER NOT NULL,
-          hash TEXT NOT NULL,text TEXT NOT NULL,UNIQUE(conversation_id,entry_id)
-        );
-        CREATE INDEX hr_conversations_project_time ON hr_conversations(project,last_active_at,id);
-        CREATE INDEX hr_entries_conversation_time ON hr_entries(conversation_id,timestamp,line);
-        CREATE INDEX hr_topic_conversations ON hr_conversation_topics(project,topic_id);
-        CREATE VIRTUAL TABLE hr_search USING fts5(row_id UNINDEXED,project UNINDEXED,conversation_id UNINDEXED,body);
-        CREATE TABLE hr_jobs (
-          project TEXT NOT NULL,file TEXT NOT NULL,directory TEXT NOT NULL,stamp TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,
-          error TEXT,retry_at INTEGER NOT NULL DEFAULT 0,lease_until INTEGER NOT NULL DEFAULT 0,token TEXT NOT NULL DEFAULT '',
-          PRIMARY KEY(project,file)
-        );
-        CREATE TABLE hr_chunk_cache (project TEXT NOT NULL,key TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(project,key));
-        CREATE TABLE hr_budget (project TEXT NOT NULL,day TEXT NOT NULL,calls INTEGER NOT NULL,PRIMARY KEY(project,day));
-        CREATE TABLE hr_model_calls (id INTEGER PRIMARY KEY,project TEXT NOT NULL,timestamp INTEGER NOT NULL,purpose TEXT NOT NULL,metric TEXT NOT NULL);
-        CREATE INDEX hr_calls_project_time ON hr_model_calls(project,timestamp);
-        PRAGMA user_version = 3;
-      `);
-    }).immediate();
+    this.db = openHistoryDatabase(dbPath);
   }
 
   close(): void { if (!this.closed) { this.closed = true; this.db.close(); } }
+
+  clearSemanticCache(): void {
+    this.db.run("DELETE FROM hr_chunk_cache WHERE project=?", [this.project]);
+  }
 
   recordModelCall(purpose: "index" | "search", metric: ModelMetric) {
     this.db.run("INSERT INTO hr_model_calls(project,timestamp,purpose,metric) VALUES (?,?,?,?)",
@@ -144,7 +122,7 @@ export class HistoryStore {
     const dir = await canonicalPath(directory);
     const exclude = options.excludeFile ? await canonicalPath(options.excludeFile) : undefined;
     const names = (await fs.readdir(dir)).filter(name => name.endsWith(".jsonl")).sort().reverse();
-    const conversations: unknown[] = [];
+    const conversations: CatalogEntry[] = [];
     for (const name of names) {
       options.signal?.throwIfAborted();
       const file = path.join(dir, name);
@@ -167,14 +145,23 @@ export class HistoryStore {
 
   async discover(directory: string, options: { file?: string; force?: boolean; signal?: AbortSignal } = {}) {
     const dir = await canonicalPath(directory);
-    const selected = options.file ? path.resolve(dir, options.file) : undefined;
-    const names = selected ? [path.basename(selected)] : (await fs.readdir(dir)).filter(name => name.endsWith(".jsonl")).sort();
+    let selected = options.file === undefined ? undefined : path.resolve(dir, options.file);
+    if (selected) {
+      const parent = await canonicalPath(path.dirname(selected));
+      if (parent !== dir || !selected.endsWith(".jsonl")) {
+        throw new RecallError("invalid_file", "Select a JSONL session file inside the session directory.");
+      }
+      selected = path.join(parent, path.basename(selected));
+    }
+    const files = selected ? [selected] : (await fs.readdir(dir)).filter(name => name.endsWith(".jsonl")).sort().map(name => path.join(dir, name));
     let queued = 0;
-    for (const name of names) {
+    for (const file of files) {
       options.signal?.throwIfAborted();
-      const file = path.join(dir, name);
       const stat = await fs.lstat(file).catch(() => null);
-      if (!stat?.isFile() || stat.isSymbolicLink()) continue;
+      if (!stat?.isFile() || stat.isSymbolicLink()) {
+        if (selected) throw new RecallError("invalid_file", "The selected session must be an existing regular file, not a symbolic link.");
+        continue;
+      }
       const stamp = `${stat.mtimeMs}:${stat.size}`;
       const existing = this.db.query<{ stamp: string }, [string, string]>(
         "SELECT stamp FROM hr_conversations WHERE project=? AND file=?").get(this.project, file);
@@ -184,15 +171,17 @@ export class HistoryStore {
         WHERE hr_jobs.stamp<>excluded.stamp OR ?=1`, [this.project, file, dir, stamp, options.force ? 1 : 0]);
       queued++;
     }
-    return { discovered: names.length, queued };
+    return { discovered: files.length, queued };
   }
 
-  private claim(): Job | null {
+  private claim(file?: string): Job | null {
     const now = Date.now();
     return this.db.transaction(() => {
-      const job = this.db.query<Omit<Job, "token">, [string, number, number]>(
-        "SELECT file,stamp,attempts FROM hr_jobs WHERE project=? AND attempts<3 AND retry_at<=? AND lease_until<=? ORDER BY file LIMIT 1")
-        .get(this.project, now, now);
+      const job = this.db.query<Omit<Job, "token">, [string, string | null, string | null, number, number]>(
+        `SELECT file,stamp,attempts FROM hr_jobs
+         WHERE project=? AND (? IS NULL OR file=?) AND attempts<3 AND retry_at<=? AND lease_until<=?
+         ORDER BY file LIMIT 1`)
+        .get(this.project, file ?? null, file ?? null, now, now);
       if (!job) return null;
       const token = randomUUID();
       this.db.run("UPDATE hr_jobs SET token=?,lease_until=? WHERE project=? AND file=?",
@@ -201,20 +190,23 @@ export class HistoryStore {
     }).immediate();
   }
 
-  async work(model: JsonModel, options: { maxJobs?: number; maxCalls?: number; maxDailyCalls?: number; signal?: AbortSignal } = {}) {
-    // Budgets count prepared conversations, not model calls: one conversation may
-    // now fan out into several chunk calls during map-reduce indexing.
-    let completed = 0, failed = 0, prepared = 0;
-    const errors: { file: string; code: string }[] = [];
-    const maxJobs = options.maxJobs ?? 1, maxConversations = options.maxCalls ?? 12, maxDailyCalls = options.maxDailyCalls ?? 60;
-    for (const value of [maxJobs, maxConversations, maxDailyCalls]) {
+  async work(model: JsonModel, options: { file?: string; maxJobs?: number; maxCalls?: number; maxDailyCalls?: number; concurrency?: number; signal?: AbortSignal } = {}): Promise<IndexResult> {
+    const concurrency = validateConcurrency(options.concurrency);
+    const maxJobs = options.maxJobs ?? 1;
+    const maxCalls = options.maxCalls ?? 12;
+    const maxDailyCalls = options.maxDailyCalls ?? 60;
+    for (const value of [maxJobs, maxCalls, maxDailyCalls]) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) throw new RecallError("invalid_budget", "Work budgets must be integers between 1 and 10000.");
     }
-    for (let index = 0; index < maxJobs && prepared < maxConversations; index++) {
+    const file = options.file === undefined ? undefined : await canonicalPath(options.file);
+    const modelBinding = [SEMANTIC_VERSION, model.identity, model.contextWindow, model.maxOutputTokens];
+    const requestKey = (system: string, input: unknown) => digest(JSON.stringify(["request", modelBinding, system, input]));
+    let completed = 0, failed = 0, calls = 0;
+    const errors: { file: string; code: string }[] = [];
+    for (let index = 0; index < maxJobs; index++) {
       options.signal?.throwIfAborted();
-      const job = this.claim();
+      const job = this.claim(file);
       if (!job) break;
-      const requestKeys: string[] = [];
       const heartbeat = setInterval(() => {
         try { if (!this.closed) this.db.run("UPDATE hr_jobs SET lease_until=? WHERE project=? AND file=? AND token=?",
           [Date.now() + 120_000, this.project, job.file, job.token]); }
@@ -224,22 +216,25 @@ export class HistoryStore {
       const budgeted: JsonModel = {
         identity: model.identity,
         contextWindow: model.contextWindow,
-        generate: async (...args) => {
-          args[2]?.throwIfAborted();
-          const key = digest(JSON.stringify(["request", SEMANTIC_VERSION, model.identity, args[0], args[1]]));
+        maxOutputTokens: model.maxOutputTokens,
+        generate: async (system, input, signal) => {
+          signal?.throwIfAborted();
+          const key = requestKey(system, input);
           const cached = this.db.query<{ payload: string }, [string, string]>(
             "SELECT payload FROM hr_chunk_cache WHERE project=? AND key=?").get(this.project, key);
-          if (cached) return JSON.parse(cached.payload) as string;
-          const day = new Date().toISOString().slice(0, 10);
-          const reserved = this.db.query<{ calls: number }, [string, string, number]>(`
-            INSERT INTO hr_budget(project,day,calls) VALUES (?,?,1)
-            ON CONFLICT(project,day) DO UPDATE SET calls=calls+1 WHERE calls<? RETURNING calls`).get(this.project, day, maxDailyCalls);
-          if (!reserved) throw new RecallError("daily_budget", "Daily indexing conversation budget reached; work resumes after UTC midnight.");
-          let result = await model.generate(...args);
+          if (cached) {
+            return JSON.parse(cached.payload) as string;
+          }
+          if (calls >= maxCalls) throw new RecallError("work_budget", "Batch indexing model-call budget reached.");
+          this.reserveModelCall(maxDailyCalls);
+          calls++;
+          let result = await model.generate(system, input, signal);
           try { result = redactJson(result); } catch { return result; }
           this.db.run("INSERT OR REPLACE INTO hr_chunk_cache VALUES (?,?,?,?)", [this.project, key, JSON.stringify(result), Date.now()]);
-          requestKeys.push(key);
           return result;
+        },
+        invalidateCachedResponse: (system, input) => {
+          this.db.run("DELETE FROM hr_chunk_cache WHERE project=? AND key=?", [this.project, requestKey(system, input)]);
         },
       };
       try {
@@ -252,14 +247,13 @@ export class HistoryStore {
           "SELECT file FROM hr_conversations WHERE project=? AND session_id=?").get(this.project, source.sessionId);
         if (duplicate && duplicate.file !== source.file) throw new RecallError("duplicate_session", "Two files claim the same session identity.");
         const facts = conversationFacts(source);
-        const cacheKey = digest(JSON.stringify([model.identity, SEMANTIC_VERSION, source.fingerprint]));
+        const vocabulary = this.topicVocabulary();
+        const cacheKey = digest(JSON.stringify(["conversation", modelBinding, source.fingerprint, vocabulary]));
         const cached = this.db.query<{ payload: string }, [string, string]>(
           "SELECT payload FROM hr_chunk_cache WHERE project=? AND key=?").get(this.project, cacheKey);
-        const vocabulary = this.topicVocabulary();
-        const semantic = cached ? JSON.parse(cached.payload)
-          : await indexConversation(budgeted, source, facts, { signal: options.signal, vocabulary });
+        const semantic = cached ? JSON.parse(cached.payload) as ConversationIndex
+          : await indexConversation(budgeted, source, facts, { signal: options.signal, vocabulary, concurrency });
         if (!cached) {
-          prepared++;
           this.db.run("INSERT OR REPLACE INTO hr_chunk_cache VALUES (?,?,?,?)",
             [this.project, cacheKey, JSON.stringify(semantic), Date.now()]);
         }
@@ -269,23 +263,38 @@ export class HistoryStore {
         completed++;
       } catch (error) {
         const code = error instanceof RecallError ? error.code : options.signal?.aborted ? "cancelled" : "index_error";
-        const retryable = ["cancelled", "work_budget", "source_busy", "daily_budget"].includes(code);
-        if (code === "invalid_model_output") for (const key of requestKeys) this.db.run("DELETE FROM hr_chunk_cache WHERE project=? AND key=?", [this.project, key]);
-        this.db.run(`UPDATE hr_jobs SET token='',lease_until=0,attempts=attempts+?,error=?,retry_at=? WHERE project=? AND file=? AND token=?`,
-          [retryable ? 0 : 1, code, code === "daily_budget" ? Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`) + 86_400_000
-            : Date.now() + (retryable ? 1000 : 30_000 * (job.attempts + 1)), this.project, job.file, job.token]);
+        this.releaseJob(job, code);
         if (options.signal?.aborted) throw error;
         failed++;
         errors.push({ file: job.file, code });
       } finally { clearInterval(heartbeat); }
     }
-    return { completed, failed, calls: prepared, errors };
+    return { completed, failed, calls, errors };
+  }
+
+  private reserveModelCall(maxDailyCalls: number): void {
+    const day = new Date().toISOString().slice(0, 10);
+    const reserved = this.db.query<{ calls: number }, [string, string, number]>(`
+      INSERT INTO hr_budget(project,day,calls) VALUES (?,?,1)
+      ON CONFLICT(project,day) DO UPDATE SET calls=calls+1 WHERE calls<? RETURNING calls`)
+      .get(this.project, day, maxDailyCalls);
+    if (!reserved) throw new RecallError("daily_budget", "Daily indexing model-call budget reached; work resumes after UTC midnight.");
+  }
+
+  private releaseJob(job: Job, code: string): void {
+    const retryable = ["cancelled", "work_budget", "source_busy", "daily_budget"].includes(code);
+    const now = Date.now();
+    const retryAt = code === "daily_budget"
+      ? Date.parse(`${new Date(now).toISOString().slice(0, 10)}T00:00:00Z`) + 86_400_000
+      : now + (retryable ? 1000 : 30_000 * (job.attempts + 1));
+    this.db.run(`UPDATE hr_jobs SET token='',lease_until=0,attempts=attempts+?,error=?,retry_at=? WHERE project=? AND file=? AND token=?`,
+      [retryable ? 0 : 1, code, retryAt, this.project, job.file, job.token]);
   }
 
   private publish(
     source: SessionSource,
-    facts: ReturnType<typeof conversationFacts>,
-    semantic: { summary: string; topics: { title: string; description: string; aliases: string[] }[] },
+    facts: ConversationFacts,
+    semantic: ConversationIndex,
     model: string,
     job: Job,
   ) {
@@ -315,8 +324,9 @@ export class HistoryStore {
         const topicId = `t_${digest(topic.title.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim()).slice(0, 20)}`;
         const existing = this.db.query<{ aliases: string }, [string, string]>(
           "SELECT aliases FROM hr_topics WHERE project=? AND id=?").get(this.project, topicId);
-        // Aliases accumulate monotonically across conversations instead of being overwritten.
-        const aliases = [...new Set([...(existing ? JSON.parse(existing.aliases) as string[] : []), ...topic.aliases])].slice(0, 24);
+        // Preserve existing aliases first, then fill the remaining bounded vocabulary.
+        const previousAliases = existing ? JSON.parse(existing.aliases) as string[] : [];
+        const aliases = [...new Set([...previousAliases, ...topic.aliases])].slice(0, 24);
         this.db.run(`INSERT INTO hr_topics VALUES (?,?,?,?,?,?,?)
           ON CONFLICT(project,id) DO UPDATE SET aliases=excluded.aliases,description=excluded.description,updated_at=excluded.updated_at`,
           [this.project, topicId, topic.title, topic.description, JSON.stringify(aliases), now, now]);
@@ -330,7 +340,7 @@ export class HistoryStore {
   private topicVocabulary(): TopicVocabulary {
     return {
       topics: this.db.query<{ id: string; title: string; description: string; aliases: string }, [string]>(
-        "SELECT id,title,description,aliases FROM hr_topics WHERE project=? ORDER BY updated_at DESC LIMIT 80")
+        "SELECT id,title,description,aliases FROM hr_topics WHERE project=? ORDER BY title COLLATE NOCASE,id LIMIT 40")
         .all(this.project)
         .map(topic => ({ id: topic.id, title: topic.title, description: topic.description, aliases: JSON.parse(topic.aliases) as string[] })),
     };
@@ -344,21 +354,16 @@ export class HistoryStore {
   }
 
   browse(options: BrowseOptions = {}) {
-    const range = timeRange(options);
-    const pred = this.predicate(range);
+    let range = timeRange(options);
     const revision = this.revision();
     const binding = digest(JSON.stringify([revision, options.days, options.from, options.to, options.topic_id]));
     let offset = 0;
     if (options.cursor) {
-      let cursor;
-      try { cursor = JSON.parse(Buffer.from(options.cursor, "base64url").toString()); } catch {}
-      if (options.cursor.length > 512 || !cursor || cursor.b !== binding || !Number.isSafeInteger(cursor.o) || cursor.o < 0) {
-        throw new RecallError("stale_cursor", "Directory changed or filters differ; restart without a cursor.");
-      }
-      if (!cursor.r || typeof cursor.r !== "object") throw new RecallError("stale_cursor", "Cursor is missing its frozen time range.");
-      offset = cursor.o;
-      range.from = cursor.r.from; range.to = cursor.r.to;
+      const cursor = browseCursor(options.cursor, binding);
+      offset = cursor.offset;
+      range = cursor.range;
     }
+    const pred = this.predicate(range);
     const limit = pageLimit(options.limit);
     let level: string;
     let rows: unknown[];
@@ -370,20 +375,24 @@ export class HistoryStore {
         .all(...pred.args, options.topic_id, limit + 1, offset) as ConversationRow[]).map(conversationPresentation);
     } else {
       level = "topics";
-      const grouped = this.db.query<{ id: string; title: string; description: string; aliases: string; conversation_id: string }, (string | null)[]>(`
-        SELECT t.*,c.id AS conversation_id FROM hr_topics t
-        JOIN hr_conversation_topics ct ON ct.project=t.project AND ct.topic_id=t.id
+      const conversations = this.db.query<ConversationRow & { topic_id: string; topic_title: string; topic_description: string; topic_aliases: string }, (string | null)[]>(`
+        SELECT c.*,t.id AS topic_id,t.title AS topic_title,t.description AS topic_description,t.aliases AS topic_aliases
+        FROM hr_topics t JOIN hr_conversation_topics ct ON ct.project=t.project AND ct.topic_id=t.id
         JOIN hr_conversations c ON c.id=ct.conversation_id
-        WHERE ${pred.sql} ORDER BY t.id,c.last_active_at DESC`)
-        .all(...pred.args)
-        .reduce<Record<string, { topic: TopicRow; conversations: ConversationRow[] }>>((accumulator, row) => {
-          const topic = { id: row.id, title: row.title, description: row.description, aliases: row.aliases };
-          accumulator[row.id] ??= { topic, conversations: [] };
-          accumulator[row.id].conversations.push(
-            this.db.query<ConversationRow, [string]>("SELECT * FROM hr_conversations WHERE id=?").get(row.conversation_id)!);
-          return accumulator;
-        }, {});
-      rows = Object.values(grouped).map(({ topic, conversations }) => topicPresentation(topic, conversations)).slice(offset, offset + limit + 1);
+        WHERE ${pred.sql} ORDER BY t.id,c.last_active_at DESC,c.id`).all(...pred.args);
+      const grouped = new Map<string, { topic: TopicRow; conversations: ConversationRow[] }>();
+      for (const row of conversations) {
+        let group = grouped.get(row.topic_id);
+        if (!group) {
+          group = {
+            topic: { id: row.topic_id, title: row.topic_title, description: row.topic_description, aliases: row.topic_aliases },
+            conversations: [],
+          };
+          grouped.set(row.topic_id, group);
+        }
+        group.conversations.push(row);
+      }
+      rows = [...grouped.values()].map(({ topic, conversations }) => topicPresentation(topic, conversations)).slice(offset, offset + limit + 1);
     }
     return { level, range, revision, entries: rows.slice(0, limit),
       next_cursor: rows.length > limit ? Buffer.from(JSON.stringify({ b: binding, o: offset + limit, r: range })).toString("base64url") : null };

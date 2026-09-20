@@ -1,4 +1,5 @@
 import { afterEach, expect, it } from "bun:test";
+import { z } from "zod";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -40,7 +41,8 @@ it("runs real OMP tools with explicit indexing and a static system prompt", asyn
   const store = new HistoryStore(process.env.OMP_HISTORY_RECALL_DB, root);
   cleanup.push(async () => { store.close(); });
 
-  const requests: any[] = [];
+  const requestSchema = z.object({ messages: z.array(z.unknown()) });
+  const requests: z.infer<typeof requestSchema>[] = [];
   const manager = SessionManager.create(root, directory);
   const calls = [
     { name: "history_recall_conversations", args: {} },
@@ -52,7 +54,7 @@ it("runs real OMP tools with explicit indexing and a static system prompt", asyn
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
-      const body = await request.json() as any;
+      const body = requestSchema.parse(await request.json());
       requests.push(body);
       if (JSON.stringify(body.messages[0]).includes("untrusted historical DATA")) {
         return streamReply({ role: "assistant", content: JSON.stringify({
@@ -122,4 +124,13 @@ it("runs real OMP tools with explicit indexing and a static system prompt", asyn
   expect(JSON.stringify(persisted.entries)).toContain("conversation_id");
   expect(JSON.stringify(persisted.entries)).toContain("failed sync");
   expect(errors).toEqual([]);
+
+  // A failed index must be returned as a tool error, not a successful empty result.
+  calls.splice(0, calls.length, { name: "history_recall_index", args: { file: path.join(directory, "missing.jsonl") } });
+  step = 0;
+  await session.prompt("Index the selected historical file.");
+  const afterFailure = await loadSource(manager.getSessionFile()!, { project: root });
+  const failedTool = afterFailure.entries.filter(entry => entry.role === "toolResult").at(-1)!;
+  expect(JSON.parse(failedTool.raw)).toMatchObject({ message: { isError: true } });
+  expect(store.status().conversations).toBe(1);
 }, 60_000);

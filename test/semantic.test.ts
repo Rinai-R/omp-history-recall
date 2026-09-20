@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { conversationFacts, indexConversation, planChunks, rewriteQuery, type TopicVocabulary } from "../src/semantic";
-import { loadSource } from "../src/source";
+import { conversationFacts, indexConversation, rewriteQuery, type JsonModel, type TopicVocabulary } from "../src/semantic";
+import { inputBudget, planChunks, requestBytes, type IndexedEntry } from "../src/chunking";
+import { mapConcurrent } from "../src/concurrency";
+import { loadSource, type SourceEntry } from "../src/source";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +21,117 @@ async function source() {
   const loaded = await loadSource(file);
   return { root, file, loaded, cleanup: () => fs.rm(root, { recursive: true, force: true }) };
 }
+
+function entries(count: number, text: string): SourceEntry[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `e${String(index).padStart(3, "0")}`, parentId: null, timestamp: "2026-09-20T01:00:00Z", type: "message", role: "user",
+    text, line: index + 1, hash: `h${index}`, raw: "",
+  }));
+}
+
+type CallInput = { entries?: IndexedEntry[]; segments?: { summary: string }[]; entry_count?: number };
+
+function gatedModel() {
+  const calls: { system: string; input: unknown; signal?: AbortSignal; response: PromiseWithResolvers<string> }[] = [];
+  const invalidated: { system: string; input: unknown }[] = [];
+  let changed = Promise.withResolvers<void>();
+  let active = 0;
+  let maximumActive = 0;
+  const notify = () => {
+    const previous = changed;
+    changed = Promise.withResolvers<void>();
+    previous.resolve();
+  };
+  const model: JsonModel = {
+    identity: "gated", contextWindow: 10_000, maxOutputTokens: 1024,
+    generate(system, input, signal) {
+      const response = Promise.withResolvers<string>();
+      calls.push({ system, input, signal, response });
+      active++;
+      maximumActive = Math.max(maximumActive, active);
+      response.promise.then(() => { active--; }, () => { active--; });
+      notify();
+      return response.promise;
+    },
+    invalidateCachedResponse(system, input) {
+      invalidated.push({ system, input });
+      notify();
+    },
+  };
+  return {
+    model, calls, invalidated,
+    get active() { return active; },
+    get maximumActive() { return maximumActive; },
+    async waitForCalls(count: number) {
+      while (calls.length < count) await changed.promise;
+    },
+    async waitForInvalidations(count: number) {
+      while (invalidated.length < count) await changed.promise;
+    },
+  };
+}
+
+describe("bounded concurrency", () => {
+  it("refills free slots without reordering results or exceeding either concurrency boundary", async () => {
+    for (const concurrency of [1, 32]) {
+      const gates = Array.from({ length: concurrency + 2 }, () => Promise.withResolvers<number>());
+      const started: number[] = [];
+      const run = mapConcurrent(gates, concurrency, (gate, index) => {
+        started.push(index);
+        return gate.promise;
+      });
+      expect(started).toEqual(Array.from({ length: concurrency }, (_, index) => index));
+      for (let index = concurrency - 1; index < gates.length; index++) {
+        gates[index].resolve(index);
+        await gates[index].promise;
+        expect(started).toHaveLength(Math.min(index + 2, gates.length));
+      }
+      for (let index = concurrency - 2; index >= 0; index--) gates[index].resolve(index);
+      expect(await run).toEqual(gates.map((_, index) => index));
+    }
+  });
+
+  it("stops queued tasks on the first error and drains a still-running peer", async () => {
+    const gates = Array.from({ length: 4 }, () => Promise.withResolvers<number>());
+    const started: number[] = [];
+    const finished: number[] = [];
+    const failure = new Error("provider failed");
+    const run = mapConcurrent(gates, 2, async (gate, index) => {
+      started.push(index);
+      const value = await gate.promise;
+      finished.push(index);
+      return value;
+    });
+    let settled = false;
+    const outcome = run.then(() => {
+      settled = true;
+      return { error: undefined, finished: [...finished] };
+    }, (error: unknown) => {
+      settled = true;
+      return { error, finished: [...finished] };
+    });
+    gates[0].reject(failure);
+    // Drain ready promise continuations; the peer remains blocked on its gate.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(started).toEqual([0, 1]);
+    gates[1].resolve(1);
+    expect(await outcome).toEqual({ error: failure, finished: [1] });
+    expect(started).toEqual([0, 1]);
+  });
+
+  it("does not start work for an already-aborted signal", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancelled before scheduling");
+    controller.abort(reason);
+    const started: number[] = [];
+    await expect(mapConcurrent([0, 1], 2, async item => {
+      started.push(item);
+      return item;
+    }, controller.signal)).rejects.toBe(reason);
+    expect(started).toEqual([]);
+  });
+});
 
 describe("conversation semantics", () => {
   it("computes activity windows, message counts, user turns and branches", async () => {
@@ -42,84 +155,239 @@ describe("conversation semantics", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it("plans chunks by byte budget and merges a short tail", () => {
-    const entries = (count: number, bytes: number) => Array.from({ length: count }, (_, index) => ({
-      id: `e${index}`, parentId: null, timestamp: "2026-09-20T01:00:00Z", type: "message", role: "user",
-      text: "x".repeat(bytes), line: index, hash: `h${index}`, raw: "",
-    }));
-    // Small context: usable budget = (32768*0.5 - 4096) * 3 = ~36,864 bytes; each
-    // entry ~1,024 bytes of text -> chunk boundaries form well before 40 entries.
-    const many = planChunks(entries(80, 1000), 32_768);
-    expect(many.length).toBeGreaterThan(1);
-    expect(many.flatMap(chunk => chunk.entries)).toHaveLength(80);
-    for (const chunk of many.slice(0, -1)) expect(chunk.bytes).toBeGreaterThan(0);
+  it("rejects invalid concurrency before the empty-conversation shortcut", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: [] };
+      const controlled = gatedModel();
+      for (const concurrency of [0, -1, 1.5, 33, NaN, Infinity]) {
+        await expect(indexConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency }))
+          .rejects.toMatchObject({ code: "invalid_concurrency" });
+      }
+      expect(controlled.calls).toEqual([]);
+    } finally { await fixture.cleanup(); }
+  });
 
-    // A tail with fewer than 10 entries is folded into the previous chunk when
-    // the combination stays within the full window budget.
-    const shortTail = entries(43, 1000);
-    const planned = planChunks(shortTail, 32_768);
-    const last = planned.at(-1)!;
-    if (planned.length === 1) {
-      expect(last.entries).toHaveLength(43);
-    } else {
-      expect(last.entries.length).toBeGreaterThanOrEqual(10);
+  it("keeps both concurrent layers ordered when their earliest request finishes last", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
+      const controlled = gatedModel();
+      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded));
+      const released = new Set<number>();
+      const lastId = loaded.entries.at(-1)!.id;
+      const respond = (index: number) => {
+        const input = controlled.calls[index].input as CallInput;
+        const ids = input.entries ? input.entries.map(entry => entry.id).join(",")
+          : input.segments!.map(segment => segment.summary.split("|")[0]).join(",");
+        controlled.calls[index].response.resolve(JSON.stringify({
+          summary: `${ids}|${input.entries ? "x".repeat(1800) : ""}`, topics: [],
+        }));
+        released.add(index);
+      };
+      expect(controlled.calls).toHaveLength(3);
+      while (!(controlled.calls.at(-1)!.input as CallInput).entries!.some(entry => entry.id === lastId)) {
+        const count = controlled.calls.length;
+        respond(count - 1);
+        await controlled.waitForCalls(count + 1);
+      }
+      const mapCount = controlled.calls.length;
+      expect(controlled.calls.every(call => (call.input as CallInput).entries)).toBe(true);
+      for (let index = mapCount - 1; index >= 0; index--) if (!released.has(index)) respond(index);
+      await controlled.waitForCalls(mapCount + 3);
+      expect(controlled.calls.slice(mapCount).every(call => (call.input as CallInput).entry_count === undefined)).toBe(true);
+      while (!(controlled.calls.at(-1)!.input as CallInput).segments!.some(segment => segment.summary.split("|")[0].split(",").includes(lastId))) {
+        const count = controlled.calls.length;
+        respond(count - 1);
+        await controlled.waitForCalls(count + 1);
+      }
+      const reduceEnd = controlled.calls.length;
+      expect(controlled.calls.every(call => (call.input as CallInput).entry_count === undefined)).toBe(true);
+      for (let index = reduceEnd - 1; index >= mapCount; index--) if (!released.has(index)) respond(index);
+      await controlled.waitForCalls(reduceEnd + 1);
+      const final = controlled.calls[reduceEnd];
+      const finalInput = final.input as CallInput;
+      expect(finalInput.entry_count).toBe(loaded.entries.length);
+      expect(finalInput.segments!.flatMap(segment => segment.summary.split("|")[0].split(",")))
+        .toEqual(loaded.entries.map(entry => entry.id));
+      final.response.resolve(JSON.stringify({ summary: "Ordered history", topics: [{ title: "Storage", description: "Durability", aliases: [] }] }));
+      expect((await run).summary).toBe("Ordered history");
+      expect(controlled.maximumActive).toBe(3);
+      expect(controlled.active).toBe(0);
+      expect(controlled.calls).toHaveLength(reduceEnd + 1);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("evicts each invalid concurrent response without evicting a valid sibling or publishing a final index", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
+      const controlled = gatedModel();
+      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded));
+      const outcome = run.then(() => ({ error: undefined, active: controlled.active, invalidated: [...controlled.invalidated] }),
+        (error: unknown) => ({ error, active: controlled.active, invalidated: [...controlled.invalidated] }));
+      const [first, valid, invalid] = controlled.calls;
+      first.response.resolve("not JSON");
+      await controlled.waitForInvalidations(1);
+      valid.response.resolve(JSON.stringify({ summary: "Valid cached summary", topics: [] }));
+      await valid.response.promise;
+      invalid.response.resolve(JSON.stringify({ summary: "Missing required topics" }));
+      expect(await outcome).toMatchObject({ error: { code: "invalid_model_output" }, active: 0, invalidated: [
+        { system: first.system, input: first.input }, { system: invalid.system, input: invalid.input },
+      ] });
+      expect(controlled.invalidated.map(request => request.input)).toEqual([first.input, invalid.input]);
+      expect(controlled.calls).toHaveLength(3);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("drains ignored map cancellation without starting queued chunks or the final layer", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
+      const controlled = gatedModel();
+      const controller = new AbortController();
+      const reason = new Error("index cancelled");
+      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded), { signal: controller.signal, concurrency: 2 });
+      let settled = false;
+      const outcome = run.then(() => {
+        settled = true;
+        return { error: undefined, active: controlled.active };
+      }, (error: unknown) => {
+        settled = true;
+        return { error, active: controlled.active };
+      });
+      expect(controlled.calls).toHaveLength(2);
+      controller.abort(reason);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      for (const call of controlled.calls) {
+        expect(call.signal).toBe(controller.signal);
+        call.response.resolve(JSON.stringify({ summary: "Finished despite cancellation", topics: [] }));
+        await call.response.promise;
+      }
+      expect(await outcome).toEqual({ error: reason, active: 0 });
+      expect(controlled.calls).toHaveLength(2);
+      expect(controlled.invalidated).toEqual([]);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("rejects a completed final response when its provider ignores cancellation", async () => {
+    const fixture = await source();
+    try {
+      const controlled = gatedModel();
+      const controller = new AbortController();
+      const reason = new Error("final cancelled");
+      const run = indexConversation(controlled.model, fixture.loaded, conversationFacts(fixture.loaded), { signal: controller.signal });
+      const outcome = run.catch((error: unknown) => error);
+      controller.abort(reason);
+      controlled.calls[0].response.resolve(JSON.stringify({
+        summary: "Must not publish", topics: [{ title: "Storage", description: "Durability", aliases: [] }],
+      }));
+      expect(await outcome).toBe(reason);
+      expect(controlled.active).toBe(0);
+      expect(controlled.invalidated).toEqual([]);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("merges a nine-entry tail, but not ten entries or an oversized final envelope", () => {
+    const records = entries(30, "界".repeat(20));
+    const sample: IndexedEntry = {
+      id: records[0].id, parent_id: null, time: records[0].timestamp, role: "user", text: records[0].text,
+    };
+    const overheadBytes = requestBytes("policy", { title: "Timeline", entries: [] });
+    const targetBytes = overheadBytes + 20 * Buffer.byteLength(JSON.stringify(sample), "utf8") + 19;
+    const budget = { maximumBytes: targetBytes * 2, overheadBytes, finalOverheadBytes: overheadBytes };
+
+    expect(planChunks(records.slice(0, 29), budget).map(chunk => chunk.length)).toEqual([29]);
+    expect(planChunks(records, budget).map(chunk => chunk.length)).toEqual([20, 10]);
+    expect(planChunks(records.slice(0, 29), { ...budget, finalOverheadBytes: targetBytes }).map(chunk => chunk.length))
+      .toEqual([20, 9]);
+  });
+
+  it("preserves oversized Unicode text exactly with byte-bounded, contiguous fragments", () => {
+    const text = "前😀\\\"\n\0".repeat(2000) + "THE_MIDDLE_MUST_SURVIVE" + "後🧭".repeat(2000);
+    const records = entries(1, text);
+    const system = "分类器";
+    const metadata = { title: "日志\"\n", entries: [] };
+    const maximumBytes = 2048;
+    const overheadBytes = requestBytes(system, metadata);
+    const chunks = planChunks(records, { maximumBytes, overheadBytes, finalOverheadBytes: overheadBytes });
+    const fragments = chunks.flat();
+    expect(fragments.map(fragment => fragment.text).join("")).toBe(text);
+    let offset = 0;
+    for (const fragment of fragments) {
+      expect(fragment.text_offset).toBe(offset);
+      expect(fragment.text_length).toBe(text.length);
+      expect(fragment.text).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
+      offset += fragment.text.length;
+    }
+    for (let index = 0; index < chunks.length; index++) {
+      const limit = index === chunks.length - 1 ? maximumBytes : maximumBytes / 2;
+      expect(requestBytes(system, { ...metadata, entries: chunks[index] })).toBeLessThanOrEqual(limit);
     }
   });
 
-  it("keeps a single chunk within budget for oversized single entries", () => {
-    const oversized = [{
-      id: "e0", parentId: null, timestamp: "2026-09-20T01:00:00Z", type: "message", role: "user",
-      text: "y".repeat(50_000), line: 0, hash: "h0", raw: "",
-    }];
-    const planned = planChunks(oversized, 32_768);
-    expect(planned).toHaveLength(1);
-    // Entry text is truncated to head 2000 + omission marker + tail 1000.
-    expect(planned[0].entries[0].text).toContain("[PREVIEW OMITTED MIDDLE]");
-    expect(planned[0].entries[0].text.length).toBeLessThanOrEqual(3030);
-  });
-
-  it("runs map then reduce over chunk summaries for long conversations", async () => {
+  it("carries middle corrections through bounded hierarchical reduction without resubmitting source text", async () => {
     const fixture = await source();
     try {
-      const longFile = path.join(fixture.root, "long.jsonl");
-      const records = [
-        { type: "session", version: 3, id: "long", cwd: fixture.root, timestamp: "2026-09-20T01:00:00Z", title: "Long" },
-        ...Array.from({ length: 100 }, (_, index) => ({
-          type: "message", id: `m${index}`, parentId: index === 0 ? null : `m${index - 1}`,
-          timestamp: "2026-09-20T01:00:00Z",
-          message: { role: index % 2 ? "assistant" : "user", content: `Topic ${index % 5} discussion with unique token tok${index}. ` + "detail ".repeat(160) },
-        })),
-      ];
-      await fs.writeFile(longFile, records.map(record => JSON.stringify(record)).join("\n") + "\n");
-      const loaded = await loadSource(longFile);
-      const facts = conversationFacts(loaded);
-      type CallInput = { entries?: { id: string }[]; segments?: { summary: string }[] };
-      const calls: { input: CallInput }[] = [];
-      const vocabulary: TopicVocabulary = { topics: [{ id: "t1", title: "Storage durability", description: "WAL", aliases: ["WAL"] }] };
-      const result = await indexConversation({
-        identity: "fixture",
-        contextWindow: 32_768,
-        generate: async (_system, input: unknown): Promise<string> => {
-          calls.push({ input: input as CallInput });
+      const correction = "The earlier success claim was wrong: WAL fsync returned EIO; durability remains unresolved.";
+      const secret = `sk-${"a".repeat(24)}`;
+      const loaded = { ...fixture.loaded, entries: entries(120, "Routine storage investigation. ".repeat(90)) };
+      loaded.entries[60].text += correction;
+      const submittedText: string[] = [];
+      let intermediateReduce = false;
+      let finalInput = "";
+      const vocabulary: TopicVocabulary = {
+        topics: [{ id: "t1", title: "TOPIC_DATA_SENTINEL", description: "WAL durability", aliases: ["WAL"] }],
+      };
+      const contextWindow = 8192;
+      const maxOutputTokens = 1024;
+      await indexConversation({
+        identity: "fixture", contextWindow, maxOutputTokens,
+        generate: async (system, input: unknown): Promise<string> => {
+          expect(requestBytes(system, input)).toBeLessThanOrEqual(inputBudget(contextWindow, maxOutputTokens));
+          expect(system).not.toContain("TOPIC_DATA_SENTINEL");
           const parsed = input as CallInput;
-          if (parsed.segments) {
-            return JSON.stringify({
-              summary: "Merged summary across segments.",
-              topics: [{ title: "Storage durability", description: "WAL persistence.", aliases: ["持久化"] }],
-            });
+          const text = parsed.entries
+            ? parsed.entries.map(entry => entry.text).join("") : parsed.segments!.map(segment => segment.summary).join("\n");
+          if (parsed.entries) submittedText.push(...parsed.entries.map(entry => entry.text));
+          else {
+            expect(text).not.toContain(secret);
+            if (parsed.entry_count === undefined) intermediateReduce = true;
+            else finalInput = text;
           }
-          return JSON.stringify({
-            summary: `Segment covering ${parsed.entries?.length ?? 0} entries.`,
-            topics: [{ title: "Storage durability", description: "WAL persistence.", aliases: ["WAL"] }],
-          });
+          const summary = parsed.entry_count !== undefined ? "Storage durability needs investigation."
+            : (text.includes(correction) ? `${correction} ${parsed.entries ? secret : ""} ` : "")
+              + "Other segment detail remains unresolved. ".repeat(38);
+          return JSON.stringify({ summary, topics: [{ title: "Storage durability", description: "WAL persistence.", aliases: ["WAL"] }] });
         },
-      }, loaded, facts, { vocabulary });
-      expect(result.summary).toBe("Merged summary across segments.");
-      expect(calls.length).toBeGreaterThan(2); // map calls + one reduce call
-      const reduceInput = calls.at(-1)!.input;
-      expect(reduceInput.segments!.length).toBe(calls.length - 1);
-      // Chunk prompts must never receive the full conversation at once.
-      for (const call of calls.slice(0, -1)) expect(call.input.entries!.length).toBeLessThan(100);
+      }, loaded, conversationFacts(loaded), { vocabulary });
+      expect(submittedText.join("")).toBe(loaded.entries.map(entry => entry.text).join(""));
+      expect(intermediateReduce).toBe(true);
+      expect(finalInput).toContain(correction);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("rejects a small advertised context instead of substituting a larger fallback", async () => {
+    const fixture = await source();
+    try {
+      await expect(indexConversation({
+        identity: "small", contextWindow: 512,
+        generate: async () => { throw new Error("An impossible request must not reach the model."); },
+      }, fixture.loaded, conversationFacts(fixture.loaded))).rejects.toMatchObject({ code: "model_context_too_small" });
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("stops reduction when the model cannot shrink individually fitting summaries", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(12, "x".repeat(3000)) };
+      await expect(indexConversation({
+        identity: "nonshrinking", contextWindow: 10_000, maxOutputTokens: 1024,
+        generate: async () => JSON.stringify({
+          summary: "文".repeat(1900), topics: [{ title: "WAL", description: "Durability", aliases: [] }],
+        }),
+      }, loaded, conversationFacts(loaded))).rejects.toMatchObject({ code: "model_reduce_not_shrinking" });
     } finally { await fixture.cleanup(); }
   });
 

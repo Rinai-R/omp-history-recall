@@ -95,7 +95,7 @@ Latest: ...
 | `history_recall_search` | 用 1-8 个 query 数组搜索原文，支持 topic/会话/时间过滤，返回命中 entry ID |
 | `history_recall_read_conversation` | 分页读取 active branch，或用命中 `entry_id` 加 `before`/`after` 返回同分支最近上下文 |
 
-浏览和列表不调用模型。未变化的 conversation 索引只需一次模型调用。搜索最多一次有界查询改写，失败时降级为词项搜索。
+浏览和列表不调用模型。已索引且未变化的文件直接跳过。新会话能放进一个块时调用一次模型；长会话先分块摘要，再做有界的分层合并。命中缓存的请求不消耗调用额度。搜索可能调用一次查询改写，失败时降级为词项搜索。
 
 时间过滤支持 `days`，或包含的 `from` 加不包含的 `to`。纯日期表示 UTC 零点；本地自然日请带时区偏移。若命中 entry 有多个子分支，聚焦上下文只沿一条连续后代路径返回，并单独列出其他分支入口，不会静默合并 sibling branches。
 
@@ -113,11 +113,11 @@ Latest: ...
 
 ## 隐私与边界
 
-- 准备 conversation 时会向选定的 OMP 模型 provider 发送有界头尾文本样本；带改写的搜索会发送查询。没有 embedding 服务，但也不是纯本地推理。
+- 准备 conversation 时会分块向选定的 OMP 模型 provider 发送全部提取并脱敏的文本，而非仅头尾样本；带改写的搜索会发送查询。没有 embedding 服务，但也不是纯本地推理。
 - 会脱敏常见凭据，但正则无法识别所有秘密。不要让无权处理该历史的 provider 参与索引。
 - SQLite 索引和辅助调用指标保存在本地，数据库仅拥有者可访问；不修改源 JSONL。
 - 支持 OMP v3 文件会话；不支持仅远端/SQL 会话和图片理解。
-- 单个源文件上限 128 MiB。索引预览限制 entry 大小；原文读取保持有界并可续页。
+- 单个源文件上限 128 MiB。超长文本 entry 无损切片；原文取证仍然有界、可续页。不索引 reasoning block、图片数据和 provider 签名。
 - 源文件变化会使证据哈希失效。目录列表不排队、不修改任何状态。
 - 静态 system prompt 注入不保证 provider 缓存命中；OMP、其他插件、工具或 provider 策略仍可能影响缓存。
 
@@ -131,8 +131,11 @@ Latest: ...
 | `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | 显式批处理最大会话数 |
 | `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | 每批未缓存模型调用 |
 | `OMP_HISTORY_RECALL_DAILY_CALLS` | `60` | 每项目每 UTC 日索引调用 |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | 每层索引的最大并发模型调用数，整数 1–32；设为 `1` 恢复串行 |
 
-准备调用超时 90 秒；查询改写期限 30 秒。失败任务保留进度，连续三次后停止。
+每次准备调用超时 90 秒，不是整个会话索引的总期限；查询改写期限 30 秒。失败任务保留已校验的块进度。取消、索引期间源文件变化及额度耗尽不累计失败次数，其他错误累计三次后停止；重试由显式批次继续处理，没有空闲后台重试器。
+
+例如使用 `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` 启动，每层最多允许六个并发调用。
 
 ## 验证
 
@@ -142,4 +145,3 @@ npm run typecheck
 npm run bench:offline
 ```
 
-测试覆盖显式索引、topic timeline 渲染、时间过滤、原文读取、无项目会话整合，以及真实 OMP 扩展和工具循环。离线 benchmark 使用受控 fixture，不宣称语义质量。

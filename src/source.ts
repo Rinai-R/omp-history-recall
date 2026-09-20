@@ -43,11 +43,6 @@ export type SessionSource = {
 };
 
 export type EvidenceRef = Pick<SourceEntry, "id" | "hash">;
-export type SourceChunk = {
-  id: string;
-  parentEntryId: string | null;
-  entries: SourceEntry[];
-};
 
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -204,51 +199,6 @@ export async function loadSource(
   };
 }
 
-/** Partition the tree into disjoint chains; no chunk can mix sibling branches. */
-export function sourceChunks(source: SessionSource, maxChars = 24_000): SourceChunk[] {
-  if (maxChars < 1000) throw new RecallError("invalid_budget", "Chunk budget must be at least 1000 characters.");
-  const children = new Map<string | null, SourceEntry[]>();
-  for (const entry of source.entries) {
-    const list = children.get(entry.parentId) ?? [];
-    list.push(entry);
-    children.set(entry.parentId, list);
-  }
-  const chunks: SourceChunk[] = [];
-  const roots = [...(children.get(null) ?? [])].reverse();
-  while (roots.length) {
-    let next: SourceEntry | undefined = roots.pop();
-    let current: SourceEntry[] = [];
-    let size = 0;
-    let parent: string | null = next?.parentId ?? null;
-    const flush = () => {
-      if (current.length) chunks.push({
-        id: digest(`${source.sessionId}\0${current.map(entry => entry.id).join("\0")}`).slice(0, 24),
-        parentEntryId: parent, entries: current,
-      });
-      current = [];
-      size = 0;
-    };
-    while (next) {
-      const entry = next;
-      // All entries remain referenced, including metadata and large tool outputs.
-      const cost = Math.min(entry.text.length, 6000) + 160;
-      if (current.length && (size + cost > maxChars || current.length >= 80)) {
-        flush();
-        parent = entry.parentId;
-      }
-      current.push(entry);
-      size += cost;
-      const descendants = children.get(entry.id) ?? [];
-      if (descendants.length === 1) next = descendants[0];
-      else {
-        roots.push(...[...descendants].reverse());
-        next = undefined;
-      }
-    }
-    flush();
-  }
-  return chunks;
-}
 
 export type EvidencePage = {
   source_file: string;

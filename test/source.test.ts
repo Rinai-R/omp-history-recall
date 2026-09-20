@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { evidencePage, loadSource, redact, redactJson, sourceChunks } from "../src/source";
+import { evidencePage, loadSource, redact, redactJson } from "../src/source";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
@@ -32,15 +32,13 @@ describe("source evidence", () => {
     expect(source.fingerprint).toHaveLength(64);
   });
 
-  it("partitions forks into disjoint branch-correct chains", async () => {
+  it("rejects evidence ranges spanning sibling branches", async () => {
     const { file } = await fixture([
       message("u", null, "shared"), message("a", "u", "branch A"),
       message("b", "u", "branch B"), message("b2", "b", "B continues"),
       message("root2", null, "reset"),
     ]);
     const source = await loadSource(file);
-    expect(sourceChunks(source).map(chunk => chunk.entries.map(entry => entry.id)))
-      .toEqual([["u"], ["a"], ["b", "b2"], ["root2"]]);
     const refs = source.entries.filter(entry => ["a", "b"].includes(entry.id));
     expect(() => evidencePage(source, refs)).toThrow("crosses branches");
   });
@@ -110,29 +108,4 @@ describe("source evidence", () => {
     expect(redactJson('{ "plain": "unchanged" }')).toBe('{ "plain": "unchanged" }');
   });
 
-  it("covers every entry exactly once across many forks and chunk boundaries", async () => {
-    const entries = Array.from({ length: 160 }, (_, i) => message(`e${i}`, i ? `e${Math.floor((i - 1) / 2)}` : null, "x".repeat(400)));
-    const { file } = await fixture(entries);
-    const source = await loadSource(file);
-    const chunks = sourceChunks(source, 1100);
-    const ids = chunks.flatMap(chunk => chunk.entries.map(entry => entry.id));
-    expect(ids.length).toBe(160);
-    expect(new Set(ids).size).toBe(160);
-    for (const chunk of chunks) {
-      for (let i = 1; i < chunk.entries.length; i++) expect(chunk.entries[i].parentId).toBe(chunk.entries[i - 1].id);
-    }
-  });
-
-  it("preserves ancestry and exact coverage across deterministic randomized trees", async () => {
-    let seed = 0x12345678;
-    const next = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return seed >>> 0; };
-    for (let trial = 0; trial < 12; trial++) {
-      const entries = Array.from({ length: 60 }, (_, i) => message(`r${i}`, i && next() % 7 ? `r${next() % i}` : null, "x".repeat(next() % 1500)));
-      const { file } = await fixture(entries);
-      const source = await loadSource(file);
-      const chunks = sourceChunks(source, 2000);
-      expect(chunks.flatMap(chunk => chunk.entries.map(entry => entry.id)).sort()).toEqual(entries.map(entry => entry.id).sort());
-      for (const chunk of chunks) for (let i = 1; i < chunk.entries.length; i++) expect(chunk.entries[i].parentId).toBe(chunk.entries[i - 1].id);
-    }
-  });
 });

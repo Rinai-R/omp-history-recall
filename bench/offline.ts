@@ -48,12 +48,13 @@ try {
   const warmStart = performance.now();
   const catalog = await store.catalog(directory);
   const catalogMs = performance.now() - warmStart;
-  if (catalog.conversations.length !== count || !catalog.conversations.every((conversation: any) => conversation.indexed)) throw new Error("Catalog lost indexed conversations.");
+  const allIndexed = catalog.conversations.every(conversation => conversation.indexed);
+  if (catalog.conversations.length !== count || !allIndexed) throw new Error("Catalog lost indexed conversations.");
   const searchMs: number[] = [];
   for (let i = 0; i < Math.min(count, 100); i++) {
     const index = (i * 31) % count;
     const start = performance.now();
-    const result = await store.search([`evidence${index}slot3`, "durable writes"]);
+    const result = await store.search([`evidence${index}slot3`]);
     searchMs.push(performance.now() - start);
     if (result.conversations.length !== 1 || result.conversations[0].session_id !== `session-${index}`) throw new Error("Wrong search result.");
   }

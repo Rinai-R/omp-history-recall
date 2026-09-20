@@ -95,7 +95,7 @@ Sessions found in the current bucket whose source `cwd` differs from the current
 | `history_recall_search` | Searches original text with an array of 1-8 queries, optional topic/conversation/time filters, and returns matched entry IDs |
 | `history_recall_read_conversation` | Pages the active branch, or returns recent same-branch context around a matched `entry_id` using `before`/`after` |
 
-Browsing and listing do not invoke a model. Indexing invokes the selected model once for an unchanged conversation. Search may invoke one bounded query-rewrite call and falls back to lexical search if it fails.
+Browsing and listing do not invoke a model. Unchanged indexed files are skipped. A new conversation uses one model call when it fits in one chunk; larger conversations use chunk summaries and bounded hierarchical merging. Cached requests are free. Search may invoke one query-rewrite call and falls back to lexical search if it fails.
 
 Time filters use `days`, or inclusive `from` plus exclusive `to`. Date-only values mean UTC midnight; use an explicit offset for a local calendar day. If an entry has multiple child branches, focused context follows one contiguous descendant path and reports other branch entry IDs separately instead of silently merging sibling branches.
 
@@ -113,11 +113,11 @@ There is no idle background indexer.
 
 ## Privacy and Limits
 
-- Preparing a conversation sends a bounded head/tail text sample to the selected OMP model provider. Search with model rewrite sends the query. No embedding service is used, but this is not local-only inference.
+- Preparing a conversation sends all extracted, redacted text across bounded chunks to the selected OMP model provider, not merely a head/tail sample. Search with model rewrite sends the query. No embedding service is used, but this is not local-only inference.
 - Common credentials are redacted, but regex redaction cannot identify every secret. Do not prepare histories that the selected provider must not see.
 - The SQLite index and utility-call metrics are local with owner-only database permissions. Source JSONL files are never modified.
 - OMP v3 file-backed sessions are supported. Remote-only/SQL session storage and image understanding are not.
-- A source file limit is 128 MiB. Index previews cap each entry; original reads remain bounded and resumable.
+- A source file limit is 128 MiB. Oversized text entries are fragmented without truncation; original evidence reads remain bounded and resumable. Reasoning blocks, images and provider signatures are not indexed.
 - Source changes invalidate evidence hashes. Catalog listings do not queue or modify anything.
 - Static system-prompt injection does not guarantee provider cache hits; OMP, other extensions, tools, or provider policy can still invalidate a cache.
 
@@ -131,8 +131,11 @@ There is no idle background indexer.
 | `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | Maximum conversations in an explicit batch |
 | `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | Uncached model calls per batch |
 | `OMP_HISTORY_RECALL_DAILY_CALLS` | `60` | Indexing calls per project per UTC day |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | Maximum concurrent model calls in an indexing layer; integer 1–32 (`1` restores sequential execution) |
 
-Preparation calls time out after 90 seconds. Query rewrite has a 30-second deadline. Failed jobs retain progress and stop after three attempts.
+Each preparation call times out after 90 seconds; this is not a whole-conversation deadline. Query rewrite has a 30-second deadline. Failed jobs retain validated chunk progress. Cancellation, source changes during indexing and exhausted budgets do not count toward the three-failure limit. Retries are processed by explicit batches, not an idle background worker.
+
+For example, start OMP with `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` to allow up to six calls per layer.
 
 ## Verification
 
@@ -142,4 +145,3 @@ npm run typecheck
 npm run bench:offline
 ```
 
-Tests cover explicit indexing, topic timeline rendering, time filtering, original reads, project integration and the real OMP extension/tool loop. The offline benchmark uses controlled fixtures and makes no semantic-quality claim.
