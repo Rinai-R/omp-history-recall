@@ -1,8 +1,32 @@
 # OMP History Recall
 
+[![npm version](https://img.shields.io/npm/v/omp-history-recall)](https://www.npmjs.com/package/omp-history-recall)
+[![GitHub](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/Rinai-R/omp-history-recall)
+
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
 一个显式、渐进加载历史项目会话的 Oh My Pi 插件。
+
+## 快速开始
+
+```sh
+omp install omp-history-recall
+```
+
+等价完整命令：
+
+```sh
+omp plugin install omp-history-recall
+```
+
+如果你的可执行文件仍使用上游 Pi 名称，对应命令是 `pi install omp-history-recall`。
+安装后重启 OMP，选择已认证模型，再显式索引一个会话：
+
+```text
+/history-recall conversations
+/history-recall index /absolute/path/to/session.jsonl
+/history-recall status
+```
 
 ## 行为
 
@@ -15,20 +39,29 @@
 
 ## 安装
 
+安装已发布的 npm 包：
+
 ```sh
-cd /path/to/omp-history-recall
+omp install omp-history-recall
+```
+
+或直接从 GitHub 安装：
+
+```sh
+omp install github:Rinai-R/omp-history-recall
+```
+
+开发安装：
+
+```sh
+git clone git@github.com:Rinai-R/omp-history-recall.git
+cd omp-history-recall
 npm ci
+npm test
 omp plugin link .
 ```
 
-验证过的开发版本为 Bun 1.3.14 和 OMP 18.2.6。没有全局 `omp` 时可用 `npm exec -- omp plugin link .`。
-
-选择已认证的 OMP 模型后，先列出会话，再索引选中的文件：
-
-```text
-/history-recall conversations
-/history-recall index /absolute/path/to/session.jsonl
-```
+验证过的开发版本为 Bun 1.3.14 和 OMP 18.2.6。
 
 ## 数据模型
 

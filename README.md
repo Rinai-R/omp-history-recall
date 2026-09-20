@@ -1,8 +1,32 @@
 # OMP History Recall
 
+[![npm version](https://img.shields.io/npm/v/omp-history-recall)](https://www.npmjs.com/package/omp-history-recall)
+[![GitHub](https://img.shields.io/badge/source-GitHub-181717?logo=github)](https://github.com/Rinai-R/omp-history-recall)
+
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
 An Oh My Pi extension for explicit, progressive retrieval of historical project conversations.
+
+## Quick Start
+
+```sh
+omp install omp-history-recall
+```
+
+The equivalent full command is:
+
+```sh
+omp plugin install omp-history-recall
+```
+
+If your binary still uses the upstream Pi name, the same operation is `pi install omp-history-recall`.
+Restart OMP after installation, select an authenticated model, then explicitly index a conversation:
+
+```text
+/history-recall conversations
+/history-recall index /absolute/path/to/session.jsonl
+/history-recall status
+```
 
 ## Behavior
 
@@ -15,20 +39,29 @@ An Oh My Pi extension for explicit, progressive retrieval of historical project 
 
 ## Install
 
+Install the published npm package:
+
 ```sh
-cd /path/to/omp-history-recall
+omp install omp-history-recall
+```
+
+Or install directly from GitHub:
+
+```sh
+omp install github:Rinai-R/omp-history-recall
+```
+
+For development:
+
+```sh
+git clone git@github.com:Rinai-R/omp-history-recall.git
+cd omp-history-recall
 npm ci
+npm test
 omp plugin link .
 ```
 
-Bun >=1.3.14 and OMP 18.2.6 are the verified development versions. If `omp` is not global, use `npm exec -- omp plugin link .`.
-
-Select an authenticated OMP model, list conversations, then index a selected file:
-
-```text
-/history-recall conversations
-/history-recall index /absolute/path/to/session.jsonl
-```
+Bun >=1.3.14 and OMP 18.2.6 are the verified development versions.
 
 ## Data Model
 
