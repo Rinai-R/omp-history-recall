@@ -1,9 +1,30 @@
 {
   "name": "omp-history-recall",
   "version": "0.3.0",
-  "private": true,
+  "description": "Explicit, progressive history recall for Oh My Pi projects",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rinai-R/omp-history-recall.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Rinai-R/omp-history-recall/issues"
+  },
+  "homepage": "https://github.com/Rinai-R/omp-history-recall#readme",
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "history",
+    "memory",
+    "retrieval",
+    "agent"
+  ],
   "type": "module",
   "main": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md",
+    "README.zh-CN.md"
+  ],
   "omp": {
     "extensions": [
       "./src/index.ts"
@@ -29,6 +50,7 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "bench:offline": "bun bench/offline.ts"
+    "bench:offline": "bun bench/offline.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   }
 }
