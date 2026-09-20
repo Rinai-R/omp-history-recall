@@ -11,6 +11,7 @@ export function ompModel(ctx: ExtensionContext, observe?: (metric: ModelMetric) 
   if (!model) throw new RecallError("model_unavailable", "Select an OMP model or configure OMP_HISTORY_RECALL_MODEL.");
   return {
     identity: `${model.provider}/${model.id}`,
+    contextWindow: model.contextWindow ?? undefined,
     async generate(system, input, signal) {
       const start = performance.now();
       const metric: ModelMetric = { model: `${model.provider}/${model.id}`, elapsed_ms: 0, outcome: "failed", input: 0, output: 0, cache_read: 0, cache_write: 0, cost: null };

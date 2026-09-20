@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { conversationFacts, indexConversation, rewriteQuery, SEMANTIC_VERSION, type ActiveWindow, type JsonModel } from "./semantic";
+import { conversationFacts, indexConversation, rewriteQuery, SEMANTIC_VERSION, type ActiveWindow, type JsonModel, type TopicVocabulary } from "./semantic";
 import { canonicalPath, digest, evidencePage, loadSource, RecallError, redactJson, type SessionSource, type SourceEntry } from "./source";
 import { timeRange, type TimeFilter, type TimeRange } from "./time";
 import type { ModelMetric } from "./omp-model";
@@ -202,13 +202,15 @@ export class HistoryStore {
   }
 
   async work(model: JsonModel, options: { maxJobs?: number; maxCalls?: number; maxDailyCalls?: number; signal?: AbortSignal } = {}) {
-    let completed = 0, failed = 0, calls = 0;
+    // Budgets count prepared conversations, not model calls: one conversation may
+    // now fan out into several chunk calls during map-reduce indexing.
+    let completed = 0, failed = 0, prepared = 0;
     const errors: { file: string; code: string }[] = [];
-    const maxJobs = options.maxJobs ?? 1, maxCalls = options.maxCalls ?? 12, maxDailyCalls = options.maxDailyCalls ?? 60;
-    for (const value of [maxJobs, maxCalls, maxDailyCalls]) {
+    const maxJobs = options.maxJobs ?? 1, maxConversations = options.maxCalls ?? 12, maxDailyCalls = options.maxDailyCalls ?? 60;
+    for (const value of [maxJobs, maxConversations, maxDailyCalls]) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) throw new RecallError("invalid_budget", "Work budgets must be integers between 1 and 10000.");
     }
-    for (let index = 0; index < maxJobs && calls < maxCalls; index++) {
+    for (let index = 0; index < maxJobs && prepared < maxConversations; index++) {
       options.signal?.throwIfAborted();
       const job = this.claim();
       if (!job) break;
@@ -221,19 +223,18 @@ export class HistoryStore {
       heartbeat.unref();
       const budgeted: JsonModel = {
         identity: model.identity,
+        contextWindow: model.contextWindow,
         generate: async (...args) => {
           args[2]?.throwIfAborted();
           const key = digest(JSON.stringify(["request", SEMANTIC_VERSION, model.identity, args[0], args[1]]));
           const cached = this.db.query<{ payload: string }, [string, string]>(
             "SELECT payload FROM hr_chunk_cache WHERE project=? AND key=?").get(this.project, key);
           if (cached) return JSON.parse(cached.payload) as string;
-          if (calls >= maxCalls) throw new RecallError("work_budget", "Indexing call budget exhausted; cached progress will resume later.");
           const day = new Date().toISOString().slice(0, 10);
           const reserved = this.db.query<{ calls: number }, [string, string, number]>(`
             INSERT INTO hr_budget(project,day,calls) VALUES (?,?,1)
             ON CONFLICT(project,day) DO UPDATE SET calls=calls+1 WHERE calls<? RETURNING calls`).get(this.project, day, maxDailyCalls);
-          if (!reserved) throw new RecallError("daily_budget", "Daily indexing call budget reached; work resumes after UTC midnight.");
-          calls++;
+          if (!reserved) throw new RecallError("daily_budget", "Daily indexing conversation budget reached; work resumes after UTC midnight.");
           let result = await model.generate(...args);
           try { result = redactJson(result); } catch { return result; }
           this.db.run("INSERT OR REPLACE INTO hr_chunk_cache VALUES (?,?,?,?)", [this.project, key, JSON.stringify(result), Date.now()]);
@@ -254,9 +255,14 @@ export class HistoryStore {
         const cacheKey = digest(JSON.stringify([model.identity, SEMANTIC_VERSION, source.fingerprint]));
         const cached = this.db.query<{ payload: string }, [string, string]>(
           "SELECT payload FROM hr_chunk_cache WHERE project=? AND key=?").get(this.project, cacheKey);
-        const semantic = cached ? JSON.parse(cached.payload) : await indexConversation(budgeted, source, facts, options.signal);
-        if (!cached) this.db.run("INSERT OR REPLACE INTO hr_chunk_cache VALUES (?,?,?,?)",
-          [this.project, cacheKey, JSON.stringify(semantic), Date.now()]);
+        const vocabulary = this.topicVocabulary();
+        const semantic = cached ? JSON.parse(cached.payload)
+          : await indexConversation(budgeted, source, facts, { signal: options.signal, vocabulary });
+        if (!cached) {
+          prepared++;
+          this.db.run("INSERT OR REPLACE INTO hr_chunk_cache VALUES (?,?,?,?)",
+            [this.project, cacheKey, JSON.stringify(semantic), Date.now()]);
+        }
         const current = await loadSource(job.file, { signal: options.signal });
         if (current.fingerprint !== source.fingerprint) throw new RecallError("source_busy", "Source changed during preparation.");
         this.publish(source, facts, semantic, model.identity, job);
@@ -273,7 +279,7 @@ export class HistoryStore {
         errors.push({ file: job.file, code });
       } finally { clearInterval(heartbeat); }
     }
-    return { completed, failed, calls, errors };
+    return { completed, failed, calls: prepared, errors };
   }
 
   private publish(
@@ -307,14 +313,27 @@ export class HistoryStore {
       }
       for (const topic of semantic.topics) {
         const topicId = `t_${digest(topic.title.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim()).slice(0, 20)}`;
+        const existing = this.db.query<{ aliases: string }, [string, string]>(
+          "SELECT aliases FROM hr_topics WHERE project=? AND id=?").get(this.project, topicId);
+        // Aliases accumulate monotonically across conversations instead of being overwritten.
+        const aliases = [...new Set([...(existing ? JSON.parse(existing.aliases) as string[] : []), ...topic.aliases])].slice(0, 24);
         this.db.run(`INSERT INTO hr_topics VALUES (?,?,?,?,?,?,?)
-          ON CONFLICT(project,id) DO UPDATE SET aliases=excluded.aliases,updated_at=excluded.updated_at`,
-          [this.project, topicId, topic.title, topic.description, JSON.stringify(topic.aliases), now, now]);
+          ON CONFLICT(project,id) DO UPDATE SET aliases=excluded.aliases,description=excluded.description,updated_at=excluded.updated_at`,
+          [this.project, topicId, topic.title, topic.description, JSON.stringify(aliases), now, now]);
         this.db.run("INSERT INTO hr_conversation_topics VALUES (?,?,?)", [this.project, topicId, id]);
       }
       this.db.run("DELETE FROM hr_jobs WHERE project=? AND file=? AND token=?", [this.project, source.file, job.token]);
       this.db.run("DELETE FROM hr_chunk_cache WHERE project=? AND created_at<?", [this.project, Date.now() - 30 * 86_400_000]);
     }).immediate();
+  }
+
+  private topicVocabulary(): TopicVocabulary {
+    return {
+      topics: this.db.query<{ id: string; title: string; description: string; aliases: string }, [string]>(
+        "SELECT id,title,description,aliases FROM hr_topics WHERE project=? ORDER BY updated_at DESC LIMIT 80")
+        .all(this.project)
+        .map(topic => ({ id: topic.id, title: topic.title, description: topic.description, aliases: JSON.parse(topic.aliases) as string[] })),
+    };
   }
 
   private predicate(range: TimeRange) {
