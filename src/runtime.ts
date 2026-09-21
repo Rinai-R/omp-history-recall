@@ -1,10 +1,15 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as path from "node:path";
-import { ompModel } from "./omp-model";
-import { canonicalPath, RecallError } from "./source";
+import { ompModel, resolveRecallModel } from "./omp-model";
+import { ompRepairRunner } from "./omp-repair";
+import { RecallError } from "./source";
 import { HistoryStore, type IndexResult } from "./store";
 import { DEFAULT_INDEX_CONCURRENCY, validateConcurrency } from "./concurrency";
+import { resolveRecallScope } from "./scope";
+
+const STARTUP_CWD = process.cwd();
 type SessionState = {
+  sessionId: string;
   store: HistoryStore;
   worker?: Promise<IndexResult>;
   controller?: AbortController;
@@ -29,23 +34,22 @@ function budget(name: string, fallback: number): number {
 /** Owns per-session stores and indexing cancellation; tool registration stays in index.ts. */
 export class HistoryRuntime {
   private readonly states = new Map<string, SessionState>();
+  private readonly databaseOverride = process.env.OMP_HISTORY_RECALL_DB === undefined
+    ? undefined : path.resolve(STARTUP_CWD, process.env.OMP_HISTORY_RECALL_DB);
 
   async state(ctx: ExtensionContext): Promise<SessionState> {
-    const id = ctx.sessionManager.getSessionId();
-    const project = await canonicalPath(ctx.cwd);
-    const existing = this.states.get(id);
-    if (existing?.store.project === project) return existing;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const scope = await resolveRecallScope();
+    const databasePath = this.databaseOverride ?? path.join(scope.sessionsRoot, "history-recall", "index.db");
+    const key = JSON.stringify([sessionId, scope.id, databasePath]);
+    const access = { sessionDir: ctx.sessionManager.getSessionDir(), activeFile: ctx.sessionManager.getSessionFile(), activeSessionId: sessionId };
+    const existing = this.states.get(key);
     if (existing) {
-      await this.stop(existing);
-      existing.store.close();
-      this.states.delete(id);
+      existing.store.setSourceAccess(access);
+      return existing;
     }
-    const ready = this.states.get(id);
-    if (ready) return ready;
-    const root = path.dirname(path.resolve(ctx.sessionManager.getSessionDir()));
-    const databasePath = process.env.OMP_HISTORY_RECALL_DB ?? path.join(root, "history-recall", "index.db");
-    const state: SessionState = { store: new HistoryStore(databasePath, project, id) };
-    this.states.set(id, state);
+    const state: SessionState = { sessionId, store: new HistoryStore(databasePath, scope, access) };
+    this.states.set(key, state);
     return state;
   }
 
@@ -61,6 +65,8 @@ export class HistoryRuntime {
   async index(ctx: ExtensionContext, options: IndexOptions = {}): Promise<IndexResult> {
     options.signal?.throwIfAborted();
     const concurrency = validateConcurrency(Number(process.env.OMP_HISTORY_RECALL_CONCURRENCY ?? DEFAULT_INDEX_CONCURRENCY));
+    const file = options.file;
+    if (file !== undefined && !path.isAbsolute(file)) throw new RecallError("invalid_file", "Use the absolute source_file returned by history_recall_conversations.");
     const state = await this.state(ctx);
     if (options.force) state.controller?.abort();
     // Serialize requests, but never return another file's indexing result to this caller.
@@ -71,14 +77,15 @@ export class HistoryRuntime {
     const controller = new AbortController();
     const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
     state.controller = controller;
-    const directory = ctx.sessionManager.getSessionDir();
-    const file = options.file ? path.resolve(directory, options.file) : undefined;
     const run = async (): Promise<IndexResult> => {
       signal.throwIfAborted();
       if (options.force) state.store.clearSemanticCache();
-      await state.store.discover(directory, { file, force: options.force, signal });
-      const model = ompModel(ctx, metric => state.store.recordModelCall("index", metric));
-      return state.store.work(model, {
+      await state.store.discover({ file, force: options.force, signal });
+      const selected = resolveRecallModel(ctx);
+      const observe = (metric: Parameters<HistoryStore["recordModelCall"]>[1]) => state.store.recordModelCall("index", metric);
+      const model = ompModel(ctx, observe, selected);
+      const repair = ompRepairRunner(ctx, observe, selected);
+      return state.store.work(model, repair, {
         file,
         maxJobs: options.maxJobs ?? budget("OMP_HISTORY_RECALL_BATCH_SESSIONS", file ? 1 : 2),
         maxCalls: budget("OMP_HISTORY_RECALL_BATCH_CALLS", 12),
@@ -91,6 +98,9 @@ export class HistoryRuntime {
       const code = result.errors.at(-1)?.code;
       if (code && code !== state.lastError) {
         ctx.ui.notify(`History indexing: ${code}; progress is retained. See /history-recall status.`, "warning");
+      }
+      if (result.repair_deferred.length) {
+        ctx.ui.notify(`History repair: ${result.repair_deferred.length} historical sources are not yet available for repair; the complete history has not been repaired.`, "warning");
       }
       state.lastError = code;
       return result;
@@ -105,25 +115,26 @@ export class HistoryRuntime {
   }
 
   cancel(ctx: ExtensionContext): void {
-    this.states.get(ctx.sessionManager.getSessionId())?.controller?.abort();
+    for (const state of this.states.values()) if (state.sessionId === ctx.sessionManager.getSessionId()) state.controller?.abort();
   }
 
   async dispose(ctx: ExtensionContext): Promise<void> {
     const id = ctx.sessionManager.getSessionId();
-    const state = this.states.get(id);
-    if (!state) return;
-    await this.stop(state);
-    state.store.close();
-    this.states.delete(id);
+    for (const [key, state] of this.states) {
+      if (state.sessionId !== id) continue;
+      await this.stop(state);
+      state.store.close();
+      this.states.delete(key);
+    }
   }
 
   async retainCurrentSession(ctx: ExtensionContext): Promise<void> {
     const current = ctx.sessionManager.getSessionId();
-    for (const [id, state] of this.states) {
-      if (id === current) continue;
+    for (const [key, state] of this.states) {
+      if (state.sessionId === current) continue;
       await this.stop(state);
       state.store.close();
-      this.states.delete(id);
+      this.states.delete(key);
     }
     await this.initialize(ctx);
   }

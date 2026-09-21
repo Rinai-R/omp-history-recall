@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { conversationFacts, indexConversation, rewriteQuery, type JsonModel, type TopicVocabulary } from "../src/semantic";
+import { analyzeConversation, conversationFacts, generateJson, rewriteQuery, validateConversationAnalysis, TopicDescriptorSchema,
+  type ConversationAnalysis, type JsonModel } from "../src/semantic";
 import { inputBudget, planChunks, requestBytes, type IndexedEntry } from "../src/chunking";
 import { mapConcurrent } from "../src/concurrency";
 import { loadSource, type SourceEntry } from "../src/source";
@@ -7,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { timeRange } from "../src/time";
+import { z } from "zod";
 
 async function source() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "recall-semantic-"));
@@ -29,7 +31,19 @@ function entries(count: number, text: string): SourceEntry[] {
   }));
 }
 
-type CallInput = { entries?: IndexedEntry[]; segments?: { summary: string }[]; entry_count?: number };
+type CallInput = {
+  stage: "analysis_map" | "analysis_reduce" | "analysis_final";
+  entries?: IndexedEntry[];
+  segments?: { summary: string; facets: { evidence_entry_ids: string[] }[] }[];
+  entry_count?: number;
+};
+
+function responseFacet(input: CallInput) {
+  const ids = input.entries?.map(entry => entry.id)
+    ?? input.segments!.flatMap(segment => segment.facets.flatMap(facet => facet.evidence_entry_ids));
+  return { title: "Storage durability", description: "WAL persistence.", aliases: ["WAL"],
+    evidence_entry_ids: [...new Set(ids)].slice(0, 12) };
+}
 
 function gatedModel() {
   const calls: { system: string; input: unknown; signal?: AbortSignal; response: PromiseWithResolvers<string> }[] = [];
@@ -144,14 +158,128 @@ describe("conversation semantics", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it("rejects malformed index and rewrite model output", async () => {
+  it("rejects malformed analysis and rewrite model output", async () => {
     const fixture = await source();
     try {
       const facts = conversationFacts(fixture.loaded);
-      await expect(indexConversation({ identity: "bad", generate: async () => "not json" }, fixture.loaded, facts))
+      await expect(analyzeConversation({ identity: "bad", generate: async () => "not json" }, fixture.loaded, facts))
         .rejects.toMatchObject({ code: "invalid_model_output" });
       await expect(rewriteQuery({ identity: "bad", generate: async () => '{"queries":[]}' }, ["query"]))
         .rejects.toMatchObject({ code: "invalid_model_output" });
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("does not call a model or invent facets for a source without text", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(2, "") };
+      const controlled = gatedModel();
+      const analysis = await analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
+      expect(analysis.facets).toEqual([]);
+      expect(validateConversationAnalysis(analysis, loaded)).toEqual(analysis);
+      expect(controlled.calls).toEqual([]);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("assigns local facet IDs after validation and preserves independent branch references", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: fixture.loaded.entries.map(entry => ({ ...entry })) };
+      loaded.entries[2].parentId = "u1";
+      loaded.entries[2].text = "Alternative branch: fsync succeeds, but the earlier branch still failed.";
+      const requests: CallInput[] = [];
+      const analysis = await analyzeConversation({
+        identity: "branches",
+        async generate(_system, input) {
+          requests.push(input as CallInput);
+          return JSON.stringify({ summary: "Conflicting durability outcomes remain on separate branches.", facets: [
+            { title: " Storage durability ", description: " Conflicting fsync outcomes ", aliases: [" WAL "], evidence_entry_ids: ["a1", "u2"] },
+            { title: "Acknowledgments", description: "Do not acknowledge failed writes.", aliases: [], evidence_entry_ids: ["a1"] },
+          ] });
+        },
+      }, loaded, conversationFacts(loaded));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].stage).toBe("analysis_final");
+      expect(requests[0].entries!.map(entry => [entry.id, entry.parent_id])).toEqual([["u1", null], ["a1", "u1"], ["u2", "u1"]]);
+      expect(analysis.facets).toEqual([
+        { id: "f0", title: "Storage durability", description: "Conflicting fsync outcomes", aliases: ["WAL"], evidence_entry_ids: ["a1", "u2"] },
+        { id: "f1", title: "Acknowledgments", description: "Do not acknowledge failed writes.", aliases: [], evidence_entry_ids: ["a1"] },
+      ]);
+      expect(validateConversationAnalysis(analysis, loaded)).toEqual(analysis);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("rejects malformed evidence instead of silently dropping references or accepting model-owned IDs", async () => {
+    const fixture = await source();
+    try {
+      const descriptor = { title: "Storage", description: "Durability", aliases: [] };
+      for (const facets of [
+        [{ ...descriptor, evidence_entry_ids: ["missing"] }],
+        [{ ...descriptor, evidence_entry_ids: ["u1", "u1"] }],
+        [{ ...descriptor, evidence_entry_ids: [] }],
+        [{ ...descriptor, evidence_entry_ids: ["u1"], id: "f0" }],
+        [],
+      ]) {
+        const controlled = gatedModel();
+        const run = analyzeConversation(controlled.model, fixture.loaded, conversationFacts(fixture.loaded));
+        const outcome = run.catch((error: unknown) => error);
+        const call = controlled.calls[0];
+        call.response.resolve(JSON.stringify({ summary: "Malformed facets", facets }));
+        expect(await outcome).toMatchObject({ code: "invalid_model_output" });
+        expect(controlled.invalidated).toEqual([{ system: call.system, input: call.input }]);
+      }
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("revalidates cached analysis numbering, shape and evidence against the current source", async () => {
+    const fixture = await source();
+    try {
+      const valid: ConversationAnalysis = { summary: "WAL errors", facets: [
+        { id: "f0", title: "Storage", description: "Durability", aliases: [], evidence_entry_ids: ["u1"] },
+      ] };
+      expect(validateConversationAnalysis(valid, fixture.loaded)).toEqual(valid);
+      const badValues = [
+        { ...valid, facets: [{ ...valid.facets[0], id: "f1" }] },
+        { ...valid, facets: [{ ...valid.facets[0], evidence_entry_ids: ["missing"] }] },
+        { ...valid, facets: [{ ...valid.facets[0], evidence_entry_ids: ["u1", "u1"] }] },
+        { ...valid, facets: [{ ...valid.facets[0], evidence_entry_ids: [] }] },
+        { ...valid, facets: [{ ...valid.facets[0], injected: true }] },
+        { ...valid, summary: "x".repeat(1201) },
+        { ...valid, facets: [] },
+      ];
+      for (const value of badValues) {
+        expect(() => validateConversationAnalysis(value, fixture.loaded)).toThrow(expect.objectContaining({ code: "invalid_model_output" }));
+      }
+      const changed = { ...fixture.loaded, entries: fixture.loaded.entries.filter(entry => entry.id !== "u1") };
+      expect(() => validateConversationAnalysis(valid, changed)).toThrow(expect.objectContaining({ code: "invalid_model_output" }));
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("invalidates reduce and final references absent from their immediate candidate evidence", async () => {
+    const fixture = await source();
+    try {
+      const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
+      for (const stage of ["analysis_reduce", "analysis_final"] as const) {
+        const calls: { system: string; input: CallInput }[] = [];
+        const invalidated: { system: string; input: unknown }[] = [];
+        await expect(analyzeConversation({
+          identity: stage, contextWindow: 10_000, maxOutputTokens: 1024,
+          async generate(system, raw) {
+            const input = raw as CallInput;
+            calls.push({ system, input });
+            if (input.stage === "analysis_map") {
+              return JSON.stringify({ summary: stage === "analysis_reduce" ? "x".repeat(1800) : "Discarded evidence", facets: [] });
+            }
+            return JSON.stringify({ summary: "A source reference is not enough after evidence was discarded.", facets: [
+              { title: "Storage", description: "Durability", aliases: [], evidence_entry_ids: [loaded.entries[0].id] },
+            ] });
+          },
+          invalidateCachedResponse(system, input) { invalidated.push({ system, input }); },
+        }, loaded, conversationFacts(loaded))).rejects.toMatchObject({ code: "invalid_model_output" });
+        expect(invalidated.length).toBeGreaterThan(0);
+        expect(invalidated).toEqual(calls.filter(call => call.input.stage === stage));
+        expect(calls.every(call => call.input.stage === "analysis_map" || call.input.stage === stage)).toBe(true);
+      }
     } finally { await fixture.cleanup(); }
   });
 
@@ -161,7 +289,7 @@ describe("conversation semantics", () => {
       const loaded = { ...fixture.loaded, entries: [] };
       const controlled = gatedModel();
       for (const concurrency of [0, -1, 1.5, 33, NaN, Infinity]) {
-        await expect(indexConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency }))
+        await expect(analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency }))
           .rejects.toMatchObject({ code: "invalid_concurrency" });
       }
       expect(controlled.calls).toEqual([]);
@@ -173,7 +301,7 @@ describe("conversation semantics", () => {
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded));
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
       const released = new Set<number>();
       const lastId = loaded.entries.at(-1)!.id;
       const respond = (index: number) => {
@@ -181,7 +309,7 @@ describe("conversation semantics", () => {
         const ids = input.entries ? input.entries.map(entry => entry.id).join(",")
           : input.segments!.map(segment => segment.summary.split("|")[0]).join(",");
         controlled.calls[index].response.resolve(JSON.stringify({
-          summary: `${ids}|${input.entries ? "x".repeat(1800) : ""}`, topics: [],
+          summary: `${ids}|${input.entries ? "x".repeat(1800) : ""}`, facets: [responseFacet(input)],
         }));
         released.add(index);
       };
@@ -195,14 +323,14 @@ describe("conversation semantics", () => {
       expect(controlled.calls.every(call => (call.input as CallInput).entries)).toBe(true);
       for (let index = mapCount - 1; index >= 0; index--) if (!released.has(index)) respond(index);
       await controlled.waitForCalls(mapCount + 3);
-      expect(controlled.calls.slice(mapCount).every(call => (call.input as CallInput).entry_count === undefined)).toBe(true);
+      expect(controlled.calls.slice(mapCount).every(call => (call.input as CallInput).stage === "analysis_reduce")).toBe(true);
       while (!(controlled.calls.at(-1)!.input as CallInput).segments!.some(segment => segment.summary.split("|")[0].split(",").includes(lastId))) {
         const count = controlled.calls.length;
         respond(count - 1);
         await controlled.waitForCalls(count + 1);
       }
       const reduceEnd = controlled.calls.length;
-      expect(controlled.calls.every(call => (call.input as CallInput).entry_count === undefined)).toBe(true);
+      expect(controlled.calls.every(call => (call.input as CallInput).stage !== "analysis_final")).toBe(true);
       for (let index = reduceEnd - 1; index >= mapCount; index--) if (!released.has(index)) respond(index);
       await controlled.waitForCalls(reduceEnd + 1);
       const final = controlled.calls[reduceEnd];
@@ -210,7 +338,7 @@ describe("conversation semantics", () => {
       expect(finalInput.entry_count).toBe(loaded.entries.length);
       expect(finalInput.segments!.flatMap(segment => segment.summary.split("|")[0].split(",")))
         .toEqual(loaded.entries.map(entry => entry.id));
-      final.response.resolve(JSON.stringify({ summary: "Ordered history", topics: [{ title: "Storage", description: "Durability", aliases: [] }] }));
+      final.response.resolve(JSON.stringify({ summary: "Ordered history", facets: [responseFacet(finalInput)] }));
       expect((await run).summary).toBe("Ordered history");
       expect(controlled.maximumActive).toBe(3);
       expect(controlled.active).toBe(0);
@@ -218,20 +346,22 @@ describe("conversation semantics", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it("evicts each invalid concurrent response without evicting a valid sibling or publishing a final index", async () => {
+  it("evicts each invalid concurrent response without evicting a valid sibling or publishing final analysis", async () => {
     const fixture = await source();
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded));
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
       const outcome = run.then(() => ({ error: undefined, active: controlled.active, invalidated: [...controlled.invalidated] }),
         (error: unknown) => ({ error, active: controlled.active, invalidated: [...controlled.invalidated] }));
       const [first, valid, invalid] = controlled.calls;
       first.response.resolve("not JSON");
       await controlled.waitForInvalidations(1);
-      valid.response.resolve(JSON.stringify({ summary: "Valid cached summary", topics: [] }));
+      valid.response.resolve(JSON.stringify({ summary: "Valid cached summary", facets: [responseFacet(valid.input as CallInput)] }));
       await valid.response.promise;
-      invalid.response.resolve(JSON.stringify({ summary: "Missing required topics" }));
+      invalid.response.resolve(JSON.stringify({ summary: "References an entry from a different leaf", facets: [
+        { ...responseFacet(invalid.input as CallInput), evidence_entry_ids: [(first.input as CallInput).entries![0].id] },
+      ] }));
       expect(await outcome).toMatchObject({ error: { code: "invalid_model_output" }, active: 0, invalidated: [
         { system: first.system, input: first.input }, { system: invalid.system, input: invalid.input },
       ] });
@@ -247,7 +377,7 @@ describe("conversation semantics", () => {
       const controlled = gatedModel();
       const controller = new AbortController();
       const reason = new Error("index cancelled");
-      const run = indexConversation(controlled.model, loaded, conversationFacts(loaded), { signal: controller.signal, concurrency: 2 });
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { signal: controller.signal, concurrency: 2 });
       let settled = false;
       const outcome = run.then(() => {
         settled = true;
@@ -262,7 +392,7 @@ describe("conversation semantics", () => {
       expect(settled).toBe(false);
       for (const call of controlled.calls) {
         expect(call.signal).toBe(controller.signal);
-        call.response.resolve(JSON.stringify({ summary: "Finished despite cancellation", topics: [] }));
+        call.response.resolve(JSON.stringify({ summary: "Finished despite cancellation", facets: [responseFacet(call.input as CallInput)] }));
         await call.response.promise;
       }
       expect(await outcome).toEqual({ error: reason, active: 0 });
@@ -277,11 +407,11 @@ describe("conversation semantics", () => {
       const controlled = gatedModel();
       const controller = new AbortController();
       const reason = new Error("final cancelled");
-      const run = indexConversation(controlled.model, fixture.loaded, conversationFacts(fixture.loaded), { signal: controller.signal });
+      const run = analyzeConversation(controlled.model, fixture.loaded, conversationFacts(fixture.loaded), { signal: controller.signal });
       const outcome = run.catch((error: unknown) => error);
       controller.abort(reason);
       controlled.calls[0].response.resolve(JSON.stringify({
-        summary: "Must not publish", topics: [{ title: "Storage", description: "Durability", aliases: [] }],
+        summary: "Must not publish", facets: [responseFacet(controlled.calls[0].input as CallInput)],
       }));
       expect(await outcome).toBe(reason);
       expect(controlled.active).toBe(0);
@@ -337,31 +467,28 @@ describe("conversation semantics", () => {
       const submittedText: string[] = [];
       let intermediateReduce = false;
       let finalInput = "";
-      const vocabulary: TopicVocabulary = {
-        topics: [{ id: "t1", title: "TOPIC_DATA_SENTINEL", description: "WAL durability", aliases: ["WAL"] }],
-      };
       const contextWindow = 8192;
       const maxOutputTokens = 1024;
-      await indexConversation({
+      await analyzeConversation({
         identity: "fixture", contextWindow, maxOutputTokens,
         generate: async (system, input: unknown): Promise<string> => {
           expect(requestBytes(system, input)).toBeLessThanOrEqual(inputBudget(contextWindow, maxOutputTokens));
-          expect(system).not.toContain("TOPIC_DATA_SENTINEL");
+          expect(JSON.stringify(input)).not.toContain(fixture.root);
           const parsed = input as CallInput;
           const text = parsed.entries
             ? parsed.entries.map(entry => entry.text).join("") : parsed.segments!.map(segment => segment.summary).join("\n");
           if (parsed.entries) submittedText.push(...parsed.entries.map(entry => entry.text));
           else {
             expect(text).not.toContain(secret);
-            if (parsed.entry_count === undefined) intermediateReduce = true;
+            if (parsed.stage === "analysis_reduce") intermediateReduce = true;
             else finalInput = text;
           }
-          const summary = parsed.entry_count !== undefined ? "Storage durability needs investigation."
+          const summary = parsed.stage === "analysis_final" ? "Storage durability needs investigation."
             : (text.includes(correction) ? `${correction} ${parsed.entries ? secret : ""} ` : "")
               + "Other segment detail remains unresolved. ".repeat(38);
-          return JSON.stringify({ summary, topics: [{ title: "Storage durability", description: "WAL persistence.", aliases: ["WAL"] }] });
+          return JSON.stringify({ summary, facets: [responseFacet(parsed)] });
         },
-      }, loaded, conversationFacts(loaded), { vocabulary });
+      }, loaded, conversationFacts(loaded));
       expect(submittedText.join("")).toBe(loaded.entries.map(entry => entry.text).join(""));
       expect(intermediateReduce).toBe(true);
       expect(finalInput).toContain(correction);
@@ -371,7 +498,7 @@ describe("conversation semantics", () => {
   it("rejects a small advertised context instead of substituting a larger fallback", async () => {
     const fixture = await source();
     try {
-      await expect(indexConversation({
+      await expect(analyzeConversation({
         identity: "small", contextWindow: 512,
         generate: async () => { throw new Error("An impossible request must not reach the model."); },
       }, fixture.loaded, conversationFacts(fixture.loaded))).rejects.toMatchObject({ code: "model_context_too_small" });
@@ -382,10 +509,10 @@ describe("conversation semantics", () => {
     const fixture = await source();
     try {
       const loaded = { ...fixture.loaded, entries: entries(12, "x".repeat(3000)) };
-      await expect(indexConversation({
+      await expect(analyzeConversation({
         identity: "nonshrinking", contextWindow: 10_000, maxOutputTokens: 1024,
-        generate: async () => JSON.stringify({
-          summary: "文".repeat(1900), topics: [{ title: "WAL", description: "Durability", aliases: [] }],
+        generate: async (_system, input) => JSON.stringify({
+          summary: "文".repeat(1900), facets: [responseFacet(input as CallInput)],
         }),
       }, loaded, conversationFacts(loaded))).rejects.toMatchObject({ code: "model_reduce_not_shrinking" });
     } finally { await fixture.cleanup(); }
@@ -396,5 +523,51 @@ describe("conversation semantics", () => {
     for (const value of ["yesterday", "2026-09-20T00:00:00", "2026-02-30T00:00:00Z"]) {
       expect(() => timeRange({ from: value })).toThrow();
     }
+  });
+});
+
+describe("shared JSON generation", () => {
+  it("applies the UTF-8 response cap and evicts only the offending request", async () => {
+    const invalidated: unknown[] = [];
+    const request = { stage: "large_response" };
+    await expect(generateJson({
+      identity: "large",
+      generate: async () => JSON.stringify({ text: "界".repeat(30_000) }),
+      invalidateCachedResponse: (system, input) => { invalidated.push({ system, input }); },
+    }, "policy", request, z.object({ text: z.string() }).strict())).rejects.toMatchObject({ code: "invalid_model_output" });
+    expect(invalidated).toEqual([{ system: "policy", input: request }]);
+  });
+
+  it("runs request-local reference validation inside exact-response invalidation", async () => {
+    const controlled = gatedModel();
+    const request = { allowed: ["t1"] };
+    const schema = z.object({ id: z.string() }).strict().superRefine((value, context) => {
+      if (!request.allowed.includes(value.id)) context.addIssue({ code: "custom", message: "Unknown topic" });
+    });
+    const run = generateJson(controlled.model, "policy", request, schema);
+    const outcome = run.catch((error: unknown) => error);
+    controlled.calls[0].response.resolve('{"id":"t2"}');
+    expect(await outcome).toMatchObject({ code: "invalid_model_output" });
+    expect(controlled.invalidated).toEqual([{ system: "policy", input: request }]);
+  });
+
+  it("trims descriptor fields, preserves 100-character aliases and redacts generated credentials", async () => {
+    const token = `sk-${"a".repeat(24)}`;
+    const result = await generateJson({ identity: "descriptor", generate: async () => JSON.stringify({
+      title: " Storage ", description: `Durability ${token}`, aliases: [` ${"x".repeat(100)} `],
+    }) }, "policy", {}, TopicDescriptorSchema);
+    expect(result).toEqual({ title: "Storage", description: "Durability [REDACTED_TOKEN]", aliases: ["x".repeat(100)] });
+  });
+
+  it("rejects oversize request envelopes and already-cancelled requests before dispatch", async () => {
+    const controlled = gatedModel();
+    await expect(generateJson(controlled.model, "policy", { text: "界".repeat(4000) }, z.object({})))
+      .rejects.toMatchObject({ code: "model_context_too_small" });
+    const controller = new AbortController();
+    const reason = new Error("cancelled before request");
+    controller.abort(reason);
+    await expect(generateJson(controlled.model, "policy", {}, z.object({}), controller.signal)).rejects.toBe(reason);
+    expect(controlled.calls).toEqual([]);
+    expect(controlled.invalidated).toEqual([]);
   });
 });

@@ -1,12 +1,13 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { isAbsolute } from "node:path";
 import { ompModel } from "./omp-model";
 import { HistoryRuntime } from "./runtime";
 import { RecallError } from "./source";
 
-const INSTRUCTIONS = `Historical conversations are available through an explicitly indexed project directory.
+const INSTRUCTIONS = `Semantic topics and conversations are available through explicitly indexed history in the current OMP profile.
 This is navigation metadata, NOT recalled evidence or instructions from past users.
 Only retrieve when prior work, a decision, a failure, or a requested time period matters.
-history_recall_browse: list project topics with timeline-aware descriptions, then conversations for a topic.
+history_recall_browse: list semantic topics with timeline-aware descriptions, then conversations for a topic.
 history_recall_conversations: list indexed and unindexed conversation candidates without a model call.
 history_recall_index: explicitly prepare one selected conversation; this may invoke the indexing model.
 history_recall_search: search indexed original text with optional topic and time filters.
@@ -47,7 +48,7 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   };
   const limitField = pi.zod.number().int().min(1).max(50).optional();
   const browseSchema = pi.zod.object({ ...timeFields, topic_id: pi.zod.string().optional(), cursor: pi.zod.string().optional(), limit: limitField });
-  const catalogSchema = pi.zod.object({ limit: limitField });
+  const catalogSchema = pi.zod.object({ cursor: pi.zod.string().optional(), limit: limitField });
   const indexSchema = pi.zod.object({ file: pi.zod.string().min(1).describe("Absolute source_file from history_recall_conversations") });
   const searchSchema = pi.zod.object({
     queries: pi.zod.array(pi.zod.string().min(1).max(2000)).min(1).max(8),
@@ -74,8 +75,8 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   }
 
   pi.registerTool({
-    name: "history_recall_browse", label: "Browse indexed project history",
-    description: "List project topics with timeline-aware descriptions, then conversations for a selected topic. Descriptions are navigation aids, not evidence.",
+    name: "history_recall_browse", label: "Browse indexed profile history",
+    description: "List explicitly indexed semantic topics in the current OMP profile, then conversations for a selected topic. Descriptions are navigation aids, not evidence.",
     parameters: browseSchema, approval: "read", strict: true, loadMode: "essential",
     async execute(_id, params, _signal, _update, ctx) {
       try { return output((await runtime.state(ctx)).store.browse(browseSchema.parse(params))); }
@@ -84,34 +85,32 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "history_recall_conversations", label: "List historical conversations",
-    description: "List indexed and unindexed conversation files without model calls. Use a likely unindexed source_file with history_recall_index when justified.",
+    description: "List indexed and unindexed conversation files in the current OMP profile without model calls. Follow next_cursor to page; use an absolute source_file with history_recall_index when justified.",
     parameters: catalogSchema, approval: "read", strict: true, loadMode: "essential",
-    async execute(_id, params, _signal, _update, ctx) {
+    async execute(_id, params, signal, _update, ctx) {
       try {
         const parsed = catalogSchema.parse(params);
-        const catalog = await (await runtime.state(ctx)).store.catalog(ctx.sessionManager.getSessionDir(), {
-          excludeFile: ctx.sessionManager.getSessionFile(),
-        });
-        return output({ ...catalog, conversations: catalog.conversations.slice(0, parsed.limit ?? 10) });
+        return output(await (await runtime.state(ctx)).store.catalog({ ...parsed, signal }));
       } catch (error) { return failure(error); }
     },
   });
   pi.registerTool({
     name: "history_recall_index", label: "Index one conversation",
-    description: "Explicitly prepare one conversation and classify it into project topics. May invoke the configured indexing model and consume budget.",
+    description: "Explicitly prepare one authorized conversation and classify it into semantic topics in the current OMP profile. May invoke the configured indexing model and consume budget.",
     parameters: indexSchema, approval: "write", strict: true, loadMode: "essential",
     async execute(_id, params, signal, _update, ctx) {
       try {
         const parsed = indexSchema.parse(params);
         const value = await runtime.state(ctx);
         const result = await runtime.index(ctx, { file: parsed.file, maxJobs: 1, signal });
-        return output({ requested_file: parsed.file, result, status: value.store.status(), aborted: signal?.aborted ?? false });
+        return { ...output({ requested_file: parsed.file, result, status: value.store.status(), aborted: signal?.aborted ?? false }),
+          ...(result.failed > 0 ? { isError: true } : {}) };
       } catch (error) { return failure(error); }
     },
   });
   pi.registerTool({
     name: "history_recall_search", label: "Search indexed history",
-    description: "Search indexed original conversation text with optional topic/time filters. Returns conversations and matched entry IDs, not established facts.",
+    description: "Search explicitly indexed original conversation text in the current OMP profile with optional semantic topic/time filters. Returns conversations and matched entry IDs, not established facts.",
     parameters: searchSchema, approval: "read", strict: true, loadMode: "essential",
     async execute(_id, params, signal, _update, ctx) {
       try {
@@ -139,28 +138,28 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("history-recall", {
-    description: "History index: status, conversations, index [file], index-all, rebuild",
+    description: "Profile history: status, conversations, index FILE (absolute), index-all (bounded resume), rebuild (clear model cache and requeue)",
     async handler(args, ctx) {
       try {
-        const value = await runtime.state(ctx);
         const input = args.trim() || "status";
-        const space = input.indexOf(" ");
-        const command = (space === -1 ? input : input.slice(0, space)).trim();
-        const argument = space === -1 ? "" : input.slice(space + 1).trim();
-        if (!["status", "conversations", "index", "index-all", "rebuild"].includes(command)) {
-          ctx.ui.notify("Usage: /history-recall [status|conversations|index file|index-all|rebuild]", "warning");
+        const indexMatch = /^index\s+(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"']+))$/.exec(input);
+        const file = indexMatch?.[1] ?? indexMatch?.[2] ?? indexMatch?.[3];
+        const command = indexMatch ? "index" : input;
+        if (command === "index" ? !file || !isAbsolute(file) : !["status", "conversations", "index-all", "rebuild"].includes(command)) {
+          ctx.ui.notify("Usage: /history-recall [status|conversations|index ABSOLUTE_FILE|index-all|rebuild]", "warning");
           return;
         }
+        const value = await runtime.state(ctx);
         if (command === "conversations") {
-          const catalog = await value.store.catalog(ctx.sessionManager.getSessionDir(), { excludeFile: ctx.sessionManager.getSessionFile() });
+          const catalog = await value.store.catalog();
           ctx.ui.notify(JSON.stringify(catalog, null, 2), "info");
           return;
         }
         if (command !== "status") {
           await runtime.index(ctx, {
-            file: command === "index" && argument ? argument : undefined,
+            file,
             force: command === "rebuild",
-            maxJobs: command === "index" && argument ? 1 : undefined,
+            maxJobs: command === "index" ? 1 : undefined,
           });
         }
         const status = value.store.status();

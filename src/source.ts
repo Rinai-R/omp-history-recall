@@ -34,8 +34,10 @@ export type SourceEntry = {
 
 export type SessionSource = {
   sessionId: string;
-  project: string;
+  cwd: string;
   file: string;
+  sizeBytes: number;
+  stamp: string;
   title: string;
   timestamp: string;
   fingerprint: string;
@@ -116,7 +118,7 @@ function entryText(record: Record<string, unknown>): { role: string; text: strin
 
 export async function loadSource(
   file: string,
-  options: { project?: string; signal?: AbortSignal; maxBytes?: number } = {},
+  options: { signal?: AbortSignal; maxBytes?: number } = {},
 ): Promise<SessionSource> {
   options.signal?.throwIfAborted();
   const resolved = path.resolve(file);
@@ -179,7 +181,7 @@ export async function loadSource(
     stream.destroy();
   }
   if (!header || typeof header.id !== "string" || !header.id || typeof header.cwd !== "string") {
-    throw new RecallError("invalid_source", "Missing session identity or project path.");
+    throw new RecallError("invalid_source", "Missing session identity or working directory.");
   }
   if (typeof header.version !== "number" || header.version !== 3) {
     throw new RecallError("unsupported_source", "Only OMP session format version 3 is supported.");
@@ -188,12 +190,10 @@ export async function loadSource(
   if (after.ino !== stat.ino || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
     throw new RecallError("source_busy", "Session changed while being read; retry when stable.");
   }
-  const project = await canonicalPath(header.cwd);
-  if (options.project && project !== await canonicalPath(options.project)) {
-    throw new RecallError("wrong_project", "Session belongs to a different project.");
-  }
+  const cwd = await canonicalPath(header.cwd);
+  options.signal?.throwIfAborted();
   return {
-    sessionId: header.id, project, file: resolved,
+    sessionId: header.id, cwd, file: resolved, sizeBytes: stat.size, stamp: `${stat.mtimeMs}:${stat.size}`,
     title: redact(title ?? (typeof header.title === "string" ? header.title : "Untitled session")),
     timestamp: timestamp(header.timestamp), fingerprint: fileHash.digest("hex"), entries,
   };
@@ -210,10 +210,10 @@ export type EvidencePage = {
 };
 
 export function evidencePage(
-  source: SessionSource, refs: EvidenceRef[],
+  scopeId: string, source: SessionSource, refs: EvidenceRef[],
   options: { cursor?: string; maxChars?: number } = {},
 ): EvidencePage {
-  const evidenceId = digest(JSON.stringify([source.project, source.sessionId, refs]));
+  const evidenceId = digest(JSON.stringify([scopeId, source.sessionId, refs.map(({ id, hash }) => ({ id, hash }))]));
   const map = new Map(source.entries.map(entry => [entry.id, entry]));
   const selected = refs.map(ref => {
     const entry = map.get(ref.id);
@@ -229,7 +229,8 @@ export function evidencePage(
   }
   let index = 0;
   let offset = 0;
-  if (options.cursor) {
+  if (options.cursor !== undefined) {
+    if (selected.length === 0) throw new RecallError("invalid_cursor", "Cursor is outside the empty evidence range.");
     if (options.cursor.length > 512) throw new RecallError("invalid_cursor", "Cursor is too long.");
     let cursor: Record<string, unknown> | undefined;
     try { cursor = object(JSON.parse(Buffer.from(options.cursor, "base64url").toString())); } catch {}
@@ -239,7 +240,7 @@ export function evidencePage(
     index = cursor.i as number;
     offset = cursor.o as number;
   }
-  if (index < 0 || index >= selected.length || offset < 0) {
+  if (index < 0 || (selected.length > 0 && index >= selected.length) || offset < 0) {
     throw new RecallError("invalid_cursor", "Cursor is outside the evidence range.");
   }
   let remaining = options.maxChars ?? 12_000;
@@ -263,4 +264,49 @@ export function evidencePage(
     next_cursor: index < selected.length
       ? Buffer.from(JSON.stringify({ e: evidenceId, i: index, o: offset })).toString("base64url") : null,
   };
+}
+
+export function readSourceEvidence(scopeId: string, source: SessionSource, options: {
+  entry_id?: string; before?: number; after?: number; cursor?: string; maxChars?: number;
+} = {}): EvidencePage & { context?: { entry_id: string; before: number; after: number; alternate_children: string[] } } {
+  const byId = new Map(source.entries.map(entry => [entry.id, entry]));
+  let chain: SourceEntry[];
+  let context: { entry_id: string; before: number; after: number; alternate_children: string[] } | undefined;
+  if (options.entry_id !== undefined) {
+    const before = options.before ?? 3;
+    const after = options.after ?? 3;
+    for (const value of [before, after]) {
+      if (!Number.isSafeInteger(value) || value < 0 || value > 50) throw new RecallError("invalid_context", "before and after must be integers from 0 to 50.");
+    }
+    const target = byId.get(options.entry_id);
+    if (!target) throw new RecallError("not_found", "Entry does not belong to this conversation revision.");
+    const ancestors: SourceEntry[] = [];
+    for (let current: SourceEntry | undefined = target; current; current = current.parentId ? byId.get(current.parentId) : undefined) ancestors.unshift(current);
+    const prefix = ancestors.slice(Math.max(0, ancestors.length - before - 1));
+    const children = new Map<string, SourceEntry[]>();
+    for (const entry of source.entries) {
+      if (!entry.parentId) continue;
+      const list = children.get(entry.parentId) ?? [];
+      list.push(entry);
+      children.set(entry.parentId, list);
+    }
+    const descendants: SourceEntry[] = [];
+    const alternateChildren: string[] = [];
+    let current: SourceEntry | undefined = target;
+    while (descendants.length < after && current) {
+      const branches = [...(children.get(current.id) ?? [])].sort((left, right) =>
+        right.timestamp.localeCompare(left.timestamp) || right.line - left.line);
+      if (branches.length === 0) break;
+      if (branches.length > 1) alternateChildren.push(...branches.slice(1).map(entry => entry.id));
+      current = branches[0];
+      descendants.push(current);
+    }
+    chain = [...prefix, ...descendants];
+    context = { entry_id: target.id, before, after, alternate_children: alternateChildren };
+  } else {
+    const leaf = source.entries.at(-1);
+    chain = [];
+    for (let current: SourceEntry | undefined = leaf; current; current = current.parentId ? byId.get(current.parentId) : undefined) chain.unshift(current);
+  }
+  return { ...evidencePage(scopeId, source, chain.map(({ id, hash }) => ({ id, hash })), options), context };
 }

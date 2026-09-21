@@ -1,9 +1,7 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { HistoryStore } from "../src/store";
-import type { JsonModel } from "../src/semantic";
+import { createRuntimeFixture } from "../test/runtime-fixture";
 
 const { values } = parseArgs({ options: {
   conversations: { type: "string", default: "512" },
@@ -12,25 +10,36 @@ const { values } = parseArgs({ options: {
 const count = Number(values.conversations);
 if (!Number.isSafeInteger(count) || count < 1 || count > 2000) throw new Error("--conversations must be from 1 to 2000.");
 
-const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "history-offline-")));
-const directory = path.join(root, "sessions");
-await fs.mkdir(directory);
-const model: JsonModel = { identity: "offline-fixture/no-model", async generate() {
-  return JSON.stringify({
-    summary: "Controlled storage fixture for offline performance measurement.",
-    topics: [{ title: "Corpus storage", description: "Controlled durability and retrieval fixture.", aliases: ["存储", "retrieval"] }],
-  });
-} };
-const store = new HistoryStore(path.join(root, "index.db"), root);
+const dailyLimit = 10_000;
+const fixture = await createRuntimeFixture({ seedConversations: false, dailyCalls: dailyLimit, batchCalls: 12, concurrency: 3 });
+const { store, scope, root } = fixture;
+const directory = path.join(scope.sessionsRoot, "corpus");
+const out = path.resolve(values.out!);
+let accountedCalls = 0;
+let batches = 0;
+const started = performance.now();
 
 function percentile(values: number[], p: number) {
   return [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))];
 }
 
+function callCounts() {
+  let analysis = 0;
+  let selection = 0;
+  for (const { input } of fixture.utilityRequests) {
+    if (!input || typeof input !== "object" || !("stage" in input) || typeof input.stage !== "string") continue;
+    if (input.stage.startsWith("analysis_")) analysis++;
+    else if (input.stage === "select_topic") selection++;
+  }
+  return { analysis, selection, native: fixture.nativeRequests.length,
+    total: fixture.utilityRequests.length + fixture.nativeRequests.length };
+}
+
 try {
+  await fs.mkdir(directory, { recursive: true });
   for (let i = 0; i < count; i++) {
     const timestamp = new Date(Date.UTC(2026, 8, 1 + i % 20)).toISOString();
-    const records: unknown[] = [{ type: "session", version: 3, id: `session-${i}`, cwd: root, timestamp, title: `Corpus ${i}` }];
+    const records: unknown[] = [{ type: "session", version: 3, id: `session-${i}`, cwd: path.join(root, `cwd-${i % 3}`), timestamp, title: `Corpus ${i}` }];
     let parent: string | null = null;
     for (let j = 0; j < 8; j++) {
       const user = `u${i}_${j}`, assistant = `a${i}_${j}`;
@@ -41,15 +50,51 @@ try {
     await fs.writeFile(path.join(directory, `${String(i).padStart(6, "0")}.jsonl`), records.map(record => JSON.stringify(record)).join("\n") + "\n");
   }
   const coldStart = performance.now();
-  await store.discover(directory, { force: true });
-  const indexed = await store.work(model, { maxJobs: count, maxCalls: count, maxDailyCalls: 10_000 });
+  await store.discover();
+  let completed = 0;
+  // Every continuation uses the same production native runner and paid-request
+  // caches. Neither a fixture plan nor quota reset bypasses a failed child.
+  while (completed < count) {
+    const indexed = await store.work(fixture.model, fixture.repairRunner,
+      { maxJobs: 2, maxCalls: 12, maxDailyCalls: dailyLimit, concurrency: fixture.concurrency });
+    batches++;
+    accountedCalls += indexed.calls;
+    completed += indexed.completed;
+    if (indexed.errors.some(error => error.code !== "work_budget")) {
+      throw new Error(`Corpus indexing stopped: ${JSON.stringify(indexed.errors)}; fixture calls=${callCounts().total}, completed=${completed}/${count}.`);
+    }
+    if (indexed.repair_deferred.length) throw new Error(`Fresh local corpus unexpectedly deferred sources: ${JSON.stringify(indexed.repair_deferred)}`);
+    if (batches > count * 20 + 20) throw new Error(`Corpus indexing made insufficient progress; fixture calls=${callCounts().total}.`);
+    if (completed < count && indexed.completed === 0 && indexed.calls === 0) {
+      const jobs = store.status().jobs;
+      const next = Math.min(...jobs.map(job => Number(job.retry_at)));
+      if (!Number.isFinite(next) || next <= Date.now()) throw new Error(`No claimable corpus work; fixture calls=${callCounts().total}.`);
+      await Bun.sleep(next - Date.now() + 1);
+    }
+  }
   const coldMs = performance.now() - coldStart;
-  if (indexed.failed || indexed.completed !== count || store.status().conversations !== count) throw new Error("Incomplete corpus indexing.");
+  if (store.status().conversations !== count || store.status().topics !== 1) throw new Error("Incomplete or incorrectly clustered corpus.");
+  const calls = callCounts();
+  if (accountedCalls !== calls.total || fixture.peak > fixture.concurrency || accountedCalls > dailyLimit) {
+    throw new Error("Native fixture call accounting, daily quota, or concurrency bound was violated.");
+  }
+  if (count > 1 && (!calls.native || !fixture.nativeToolCalls.some(call => call.name === "repair_read"))) {
+    throw new Error("Historical maintenance did not execute through the native evidence tools.");
+  }
   const warmStart = performance.now();
-  const catalog = await store.catalog(directory);
+  const catalogFiles = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const catalog = await store.catalog({ cursor, limit: 50 });
+    if (catalog.warnings.length) throw new Error(`Catalog warnings: ${JSON.stringify(catalog.warnings)}`);
+    for (const conversation of catalog.conversations) {
+      if (!conversation.indexed || catalogFiles.has(conversation.source_file)) throw new Error("Catalog lost or duplicated an indexed conversation.");
+      catalogFiles.add(conversation.source_file);
+    }
+    cursor = catalog.next_cursor ?? undefined;
+  } while (cursor);
   const catalogMs = performance.now() - warmStart;
-  const allIndexed = catalog.conversations.every(conversation => conversation.indexed);
-  if (catalog.conversations.length !== count || !allIndexed) throw new Error("Catalog lost indexed conversations.");
+  if (catalogFiles.size !== count) throw new Error("Paged catalog did not cover the full corpus.");
   const searchMs: number[] = [];
   for (let i = 0; i < Math.min(count, 100); i++) {
     const index = (i * 31) % count;
@@ -58,18 +103,33 @@ try {
     searchMs.push(performance.now() - start);
     if (result.conversations.length !== 1 || result.conversations[0].session_id !== `session-${index}`) throw new Error("Wrong search result.");
   }
+  if (fixture.errors.length) throw new AggregateError(fixture.errors, "Local SDK fixture reported runtime errors");
   const metrics = {
-    kind: "offline-conversation-index-benchmark", semantic_quality_evaluated: false,
-    actual_model_calls: 0, conversations: count, topics: store.status().topics,
+    kind: "offline-conversation-index-benchmark", completed: true, semantic_quality_evaluated: false,
+    external_model_calls: 0, fixture_model_calls: calls.total, analysis_calls: calls.analysis, selection_calls: calls.selection,
+    native_calls: calls.native, accounted_calls: accountedCalls, batches, peak_concurrency: fixture.peak,
+    native_peak_concurrency: fixture.nativePeak, concurrency_limit: fixture.concurrency,
+    batch_job_limit: 2, batch_call_limit: 12, daily_call_limit: dailyLimit, conversations: count, topics: store.status().topics,
     indexed_entries: store.status().indexed_entries, cold_index_ms: coldMs,
     catalog_ms: catalogMs, search_ms: { p50: percentile(searchMs, .5), p95: percentile(searchMs, .95) },
     db_bytes: (await fs.stat(store.dbPath)).size, bun: Bun.version, timestamp: new Date().toISOString(),
   };
-  const out = path.resolve(values.out!);
   await fs.mkdir(path.dirname(out), { recursive: true });
   await fs.writeFile(out, JSON.stringify(metrics, null, 2));
   console.log(JSON.stringify(metrics, null, 2));
+} catch (error) {
+  const calls = callCounts();
+  const failure = {
+    kind: "offline-conversation-index-benchmark", completed: false, semantic_quality_evaluated: false,
+    requested_conversations: count, indexed_conversations: store.status().conversations,
+    fixture_model_calls: calls.total, analysis_calls: calls.analysis, selection_calls: calls.selection, native_calls: calls.native,
+    accounted_calls: accountedCalls, batches, daily_call_limit: dailyLimit, peak_concurrency: fixture.peak,
+    elapsed_ms: performance.now() - started, error: error instanceof Error ? error.message : String(error),
+  };
+  await fs.mkdir(path.dirname(out), { recursive: true });
+  await fs.writeFile(out, JSON.stringify(failure, null, 2));
+  console.error(JSON.stringify(failure, null, 2));
+  throw error;
 } finally {
-  store.close();
-  await fs.rm(root, { recursive: true, force: true });
+  await fixture.close();
 }
