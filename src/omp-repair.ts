@@ -1,13 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { toolWireSchema, type AssistantMessage, type Context, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
-import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import * as nativeProviderStreams from "@oh-my-pi/pi-ai/providers/register-builtins";
+import {
+  createAssistantMessageEventStream, toolWireSchema,
+  type AssistantMessage, type Context, type Model, type SimpleStreamOptions,
+} from "@oh-my-pi/pi-ai";
 import type { CustomTool, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { createAgentSession, SessionManager, Settings, type AgentSession } from "@oh-my-pi/pi-coding-agent";
 import { inputBudget } from "./chunking";
 import { resolveRecallModel, type ModelMetric } from "./omp-model";
 import { REPAIR_VERSION, RepairCompletionSchema, type RepairCompletion, type RepairRunner } from "./repair";
@@ -208,6 +206,15 @@ function requestOptions(options: SimpleStreamOptions): unknown {
   };
 }
 
+let settlementCapability: Promise<boolean> | undefined;
+/** Deep SDK subpaths are not host-resolvable from installed plugin directories, so probe via dynamic import. */
+function sdkSettlementCapability(): Promise<boolean> {
+  settlementCapability ??= import("@oh-my-pi/pi-ai/providers/register-builtins")
+    .then(providers => (providers as Record<string, unknown>).lazyStreamSettlementVersion === 1)
+    .catch(() => false);
+  return settlementCapability;
+}
+
 /** OMP owns the complete model/tool loop; this adapter owns admission and settlement. */
 export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelMetric) => void, model = resolveRecallModel(ctx)): RepairRunner {
   const identity = `${model.provider}/${model.id}`;
@@ -216,7 +223,7 @@ export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelM
   const inputBytes = inputBudget(contextWindow, maxOutputTokens);
   return async ({ protocol, budget, signal, concurrency }) => {
     if (signal?.aborted) throw new RecallError("cancelled", "History repair was cancelled.");
-    if (!("lazyStreamSettlementVersion" in nativeProviderStreams) || nativeProviderStreams.lazyStreamSettlementVersion !== 1) {
+    if (!await sdkSettlementCapability()) {
       throw new RecallError("unsupported_omp", "Native topic repair requires the pinned SDK inner-stream settlement patch.");
     }
     if (model.supportsTools === false || process.env.PI_DIALECT?.trim()) {
@@ -385,7 +392,7 @@ export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelM
       }));
       originalStream = child.agent.streamFn;
       child.agent.streamFn = (requestModel, context, streamOptions) => {
-        const output = new AssistantMessageEventStream();
+        const output = createAssistantMessageEventStream();
         track(output.result()).catch(() => {});
         const pump = (async () => {
           let key: string | undefined;
