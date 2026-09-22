@@ -20,7 +20,20 @@ Finish with a single native yield call whose data is {"proposal_id": string|null
 
 const REPAIR_TOOLS = ["repair_topics", "repair_members", "repair_read", "repair_propose", "repair_coverage", "repair_check"] as const;
 const allowedTools = new Set<string>([...REPAIR_TOOLS, "yield"]);
-const yieldArguments = z.object({ data: RepairCompletionSchema, type: z.string().optional() }).strict();
+/** SDK yield accepts JSON-encoded string payloads; mirror that transport leniency
+ *  while the completion object itself stays strictly validated. */
+const yieldArguments = z.object({
+  data: z.union([RepairCompletionSchema, z.string().transform((value, ctx) => {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      const completion = RepairCompletionSchema.safeParse(parsed);
+      if (completion.success) return completion.data;
+    } catch { /* fall through to the issue below */ }
+    ctx.addIssue({ code: "custom", message: "A JSON-encoded yield data string must decode to a valid completion object." });
+    return z.NEVER;
+  })]),
+  type: z.string().optional(),
+}).strict();
 const usageSchema = z.object({
   input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative(),
   cacheRead: z.number().finite().nonnegative(), cacheWrite: z.number().finite().nonnegative(),
@@ -207,11 +220,25 @@ function requestOptions(options: SimpleStreamOptions): unknown {
 }
 
 let settlementCapability: Promise<boolean> | undefined;
-/** Deep SDK subpaths are not host-resolvable from installed plugin directories, so probe via dynamic import. */
+/**
+ * The host extension loader resolves @oh-my-pi/* specifiers against the hoisted
+ * plugin-root node_modules, so the pinned settlement patch must be detected by reading
+ * the plugin-local vendored SDK source directly, outside import resolution.
+ */
 function sdkSettlementCapability(): Promise<boolean> {
-  settlementCapability ??= import("@oh-my-pi/pi-ai/providers/register-builtins")
-    .then(providers => (providers as Record<string, unknown>).lazyStreamSettlementVersion === 1)
-    .catch(() => false);
+  settlementCapability ??= (async () => {
+    for (const spec of [
+      "./node_modules/@oh-my-pi/pi-ai/src/providers/register-builtins.ts",
+      "../node_modules/@oh-my-pi/pi-ai/src/providers/register-builtins.ts",
+    ]) {
+      try {
+        const url = new URL(spec, import.meta.url);
+        const text = await (await fetch(url)).text();
+        if (text.includes("export const lazyStreamSettlementVersion = 1")) return true;
+      } catch { /* Try the next candidate location. */ }
+    }
+    return false;
+  })();
   return settlementCapability;
 }
 
@@ -426,7 +453,7 @@ export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelM
               for (const call of message.content) {
                 if (call.type !== "toolCall") continue;
                 const schemas = toolSchemas.get(call.name);
-                if (!schemas) throw new RecallError("invalid_model_output", "Repair call has no declared native tool schema.");
+                if (!schemas) { throw new RecallError("invalid_model_output", "Repair call has no declared native tool schema."); }
                 call.arguments = normalizeTransportNulls(call.arguments, schemas.canonical, schemas.transport);
                 if (call.name === "yield" && !yieldArguments.safeParse(call.arguments).success) {
                   throw new RecallError("invalid_model_output", "Repair yield requires an explicit valid completion object.");

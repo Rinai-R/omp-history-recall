@@ -62,7 +62,6 @@ is insufficient. Do not force an assignment to avoid a new topic. Later pages ma
 Return {"topic_id":string|null,"candidate_ids":[string],"reason":string}. IDs must come from candidates or previous;
 a non-null topic_id must occur in candidate_ids. candidate_ids must be unique. reason is 1–500 characters.`;
 
-const ReasonSchema = z.string().trim().min(1).max(500);
 const IdSchema = z.string().min(1);
 
 function descriptor(value: TopicDescriptor): TopicDescriptor {
@@ -155,7 +154,7 @@ export async function selectTopics(
       const end = pageEnd(sizes, state.offset, requestBytes(SELECT_SYSTEM, base), maximumBytes);
       const input = { ...base, candidates: cards.slice(state.offset, end) };
       const allowed = new Set([...input.previous, ...input.candidates].map(card => card.id));
-      const schema = z.object({ topic_id: IdSchema.nullable(), candidate_ids: z.array(IdSchema).max(3), reason: ReasonSchema }).strict()
+      const schema = z.object({ topic_id: IdSchema.nullable(), candidate_ids: z.array(IdSchema).max(3), reason: z.string() }).strict()
         .superRefine((value, context) => {
           if (new Set(value.candidate_ids).size !== value.candidate_ids.length
             || value.candidate_ids.some(id => !allowed.has(id))
@@ -170,7 +169,7 @@ export async function selectTopics(
     for (let index = 0; index < wave.length; index++) {
       const { state, end } = wave[index];
       state.offset = end;
-      state.selected = outputs[index];
+      state.selected = { ...outputs[index], reason: outputs[index].reason.trim().slice(0, 500) || "Truncated." };
       state.previous = outputs[index].candidate_ids.map(id => cardsById.get(id)!);
     }
   }

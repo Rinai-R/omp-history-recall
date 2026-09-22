@@ -44,8 +44,10 @@ function validateEvidence(facets: readonly { evidence_entry_ids: string[] }[], a
 }
 
 function analysisResponseSchema(allowed: ReadonlySet<string>, final = false) {
+  const limit = final ? 1200 : 2000;
   return AnalysisSegmentSchema.extend({
-    summary: z.string().trim().min(1).max(final ? 1200 : 2000),
+    // Long model summaries are truncated host-side instead of failing the whole analysis.
+    summary: z.string().transform(value => value.trim().slice(0, limit)).pipe(z.string().min(1)),
     facets: z.array(FacetSchema).min(final ? 1 : 0).max(5),
   }).superRefine((value, context) => validateEvidence(value.facets, allowed, context));
 }
@@ -84,7 +86,7 @@ function parseModelJson<T>(text: string, schema: z.ZodType<T>): T {
     throw new RecallError("invalid_model_output", "Model did not return one JSON object.");
   }
   const result = schema.safeParse(redactStructured(value));
-  if (!result.success) throw new RecallError("invalid_model_output", "Model JSON does not satisfy the requested schema.");
+  if (!result.success) { throw new RecallError("invalid_model_output", "Model JSON does not satisfy the requested schema."); }
   return result.data;
 }
 

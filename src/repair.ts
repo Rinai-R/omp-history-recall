@@ -13,13 +13,13 @@ export const REPAIR_VERSION = "omp-topic-repair-v1";
 const IdSchema = z.string().min(1);
 const ReasonSchema = z.string().trim().min(1).max(500);
 export const FacetRefSchema = z.object({ conversationId: IdSchema, sourceHash: IdSchema, facetId: IdSchema }).strict();
-export const RepairDraftSchema = z.object({ ref: IdSchema, descriptor: TopicDescriptorSchema }).strict();
+export const RepairDraftSchema = z.object({ ref: IdSchema.optional(), descriptor: TopicDescriptorSchema }).strict();
 export const RepairMoveSchema = FacetRefSchema.extend({ fromTopicRef: IdSchema, targetRef: IdSchema, reason: ReasonSchema }).strict();
 export const RepairUpdateSchema = z.object({ topicId: IdSchema, descriptor: TopicDescriptorSchema, reason: ReasonSchema }).strict();
 export const RepairMergeSchema = z.object({ leftTopicId: IdSchema, rightTopicId: IdSchema, descriptor: TopicDescriptorSchema, reason: ReasonSchema }).strict();
 export const RepairProposalSchema = z.object({
-  drafts: z.array(RepairDraftSchema).max(5), updates: z.array(RepairUpdateSchema).max(5),
-  moves: z.array(RepairMoveSchema).max(13), merge: RepairMergeSchema.nullable(), reason: ReasonSchema,
+  drafts: z.array(RepairDraftSchema).max(5).default([]), updates: z.array(RepairUpdateSchema).max(5).default([]),
+  moves: z.array(RepairMoveSchema).max(13).default([]), merge: RepairMergeSchema.nullable().default(null), reason: ReasonSchema,
 }).strict();
 export const RepairCompletionSchema = z.object({ proposal_id: IdSchema.nullable(), reason: ReasonSchema }).strict();
 export type FacetRef = z.infer<typeof FacetRefSchema>;
@@ -51,11 +51,11 @@ export const RepairReadSchema = z.discriminatedUnion("action", [
     before: z.number().int().min(0).max(50).optional(), after: z.number().int().min(0).max(50).optional(),
     max_chars: z.number().int().min(1000).max(12000).optional(),
   }).strict(),
-  z.object({ action: z.literal("remember"), conversation_id: IdSchema, facet_id: IdSchema, summary: ReasonSchema }).strict(),
+  z.object({ action: z.literal("remember"), conversation_id: IdSchema, facet_id: IdSchema, summary: z.string(), cursor: z.unknown().optional(), entry_id: z.unknown().optional() }).strict(),
 ]);
 export const RepairCoverageSchema = z.object({ proposal_id: IdSchema, target_ref: IdSchema, cursor: CursorSchema }).strict();
 export const RepairCheckSchema = z.object({
-  proposal_id: IdSchema, page_id: IdSchema,
+  proposal_id: IdSchema, page_id: IdSchema, target_ref: IdSchema.optional(),
   fits: z.array(z.object({ conversation_id: IdSchema, facet_id: IdSchema, fits: z.boolean() }).strict()).max(1),
 }).strict();
 
@@ -117,7 +117,7 @@ export class RepairProtocol {
   private readonly reservations = new Map<string, number>();
   private readonly readOrder = new Map<string, { before: Promise<void>; release: () => void }>();
   private readonly issuedCursors = new Map<string, unknown>();
-  private readonly finishedChecks = new Map<string, { fits: string; result: unknown }>();
+  private readonly finishedChecks = new Map<string, { fits: string; result: Record<string, unknown> }>();
   private active?: ActiveProposal;
   private sequence = 0;
   private contextBytes = 0;
@@ -300,7 +300,9 @@ export class RepairProtocol {
       } else if (call.name === "repair_check") {
         ceiling = bytes({ checked: true, accepted: false, next_cursor: "0".repeat(64), member_count: Number.MAX_SAFE_INTEGER, digest: "0".repeat(64), complete: false });
       }
-      const allocation = Math.max(minimum, Math.min(this.resultBytes, ceiling, available + minimum));
+      const floor = call.name === "repair_check" || call.name === "repair_coverage" || (call.name === "repair_read" && call.arguments.action === "remember")
+        ? ceiling : minimum;
+      const allocation = Math.max(Math.min(floor, this.resultBytes), Math.min(this.resultBytes, ceiling, available + minimum));
       this.reservations.set(call.id, allocation);
       available -= allocation - minimum;
     }
@@ -315,7 +317,14 @@ export class RepairProtocol {
           const parsed = parse(schema, args);
           const result = await run(parsed, id, signal);
           checkSignal(signal); this.revision();
-          const text = JSON.stringify(this.bounded(result, id));
+          let text: string;
+          try {
+            text = JSON.stringify(this.bounded(result, id));
+          } catch (error) {
+            if (error instanceof RecallError && error.code === "model_context_too_small" && name !== "repair_read") {
+              text = JSON.stringify({ degraded: true, hint: "The full tool result exceeded the remaining context; repeat the call if you need its details." });
+            } else throw error;
+          }
           if (!this.records.has(id)) this.records.set(id, { name });
           return { content: [{ type: "text", text }], details: { protocol: REPAIR_VERSION, view_id: this.viewId } };
         } finally { this.readOrder.get(id)?.release(); }
@@ -332,7 +341,11 @@ export class RepairProtocol {
   }
 
   private topicPage(args: z.infer<typeof RepairTopicsSchema>, id: string): unknown {
-    const start = args.cursor ? this.cursor<{ index: number }>("topics", args.cursor, value => Number.isInteger(value.index)).index : 0;
+    let start = 0;
+    if (args.cursor) {
+      try { start = this.cursor<{ index: number }>("topics", args.cursor, value => Number.isInteger(value.index)).index; }
+      catch (error) { if (error instanceof RecallError && error.code === "invalid_cursor") start = 0; else throw error; }
+    }
     const topics: unknown[] = [];
     let index = start;
     const cards = this.registry.repairCards(this.snapshot.revision);
@@ -351,12 +364,27 @@ export class RepairProtocol {
   private members(args: z.infer<typeof RepairMembersSchema>, id: string): unknown {
     if (!this.knownTopics.has(args.topic_ref)) invalid("Read a topic card before requesting its members.");
     let rawCursor: string | undefined;
-    if (args.cursor) rawCursor = this.cursor<{ topic: string; cursor: string }>("members", args.cursor, value => value.topic === args.topic_ref).cursor;
+    if (args.cursor) {
+      try {
+        rawCursor = this.cursor<{ topic: string; cursor: string }>("members", args.cursor, value => value.topic === args.topic_ref).cursor;
+      } catch (error) {
+        if (!(error instanceof RecallError && error.code === "invalid_cursor")) throw error;
+        rawCursor = undefined; // a foreign or stale token restarts this topic's paging
+      }
+    }
     if (this.active?.proposal.drafts.some(draft => draft.ref === args.topic_ref)) {
       if (args.cursor) throw new RecallError("invalid_cursor", "A repair draft has no initial members or continuation.");
       return { members: [], next_cursor: null };
     }
-    let page = this.registry.memberPage([args.topic_ref], this.incoming, this.selection, null, this.snapshot.revision, { cursor: rawCursor, limit: 64 });
+    let page: MemberPage;
+    try {
+      page = this.registry.memberPage([args.topic_ref], this.incoming, this.selection, null, this.snapshot.revision, { cursor: rawCursor, limit: 64 });
+    } catch (error) {
+      if (error instanceof RecallError && error.code === "invalid_cursor") {
+        rawCursor = undefined;
+        page = this.registry.memberPage([args.topic_ref], this.incoming, this.selection, null, this.snapshot.revision, { cursor: undefined, limit: 64 });
+      } else throw error;
+    }
     const members: ModelMemberFacet[] = [];
     // Cursor tokens always occupy 64 ASCII bytes; reserve their complete envelope before minting one.
     let used = bytes({ members: [], next_cursor: "0".repeat(64) });
@@ -378,7 +406,9 @@ export class RepairProtocol {
     if (!member) invalid("Evidence may only be read for an incoming, audit, or delivered member facet.");
     if (args.action === "remember") {
       if (!this.progress.get(facetKey)?.size) invalid("A factual note requires previously delivered original evidence.");
-      this.notes.set(facetKey, { summary: args.summary, sequence: ++this.sequence });
+      const summary = args.summary.trim().slice(0, 500);
+      if (!summary) invalid("A factual note cannot be empty.");
+      this.notes.set(facetKey, { summary, sequence: ++this.sequence });
       this.records.set(id, { name: "repair_read", facetKey });
       return { remembered: true, receipt: this.receipts.get(facetKey) ?? null };
     }
@@ -391,15 +421,30 @@ export class RepairProtocol {
     await this.readOrder.get(id)?.before;
     checkSignal(signal);
     this.revision();
-    if (!source.entries.some(entry => entry.id === args.entry_id)) invalid("The requested original entry does not belong to this conversation.");
-    const binding = { conversation: member.conversationId, source: member.sourceHash, facet: member.facetId, entry: args.entry_id, before: args.before ?? 0, after: args.after ?? 0 };
+    // Resolve the entry: explicit and present wins; an in-flight continuation or the
+    // facet's first cited evidence follows; a foreign reference falls back the same way.
+    const belongs = (id: string | undefined) => !!id && source.entries.some(entry => entry.id === id);
+    const entryId = belongs(args.entry_id) ? args.entry_id!
+      : belongs(this.continuations.get(`${member.conversationId}\0${member.facetId}`)?.entry_id) ? this.continuations.get(`${member.conversationId}\0${member.facetId}`)!.entry_id!
+      : member.evidence.find(evidence => belongs(evidence.id))?.id;
+    if (!entryId) {
+      invalid("The requested original entry does not belong to this conversation.");
+    }
+    const binding = { conversation: member.conversationId, source: member.sourceHash, facet: member.facetId, entry: entryId, before: args.before ?? 0, after: args.after ?? 0 };
     let rawCursor: string | undefined;
-    if (args.cursor) rawCursor = this.cursor<{ binding: typeof binding; cursor: string }>("read", args.cursor, value => JSON.stringify(value.binding) === JSON.stringify(binding)).cursor;
+    if (args.cursor) {
+      try {
+        rawCursor = this.cursor<{ binding: typeof binding; cursor: string }>("read", args.cursor, value => JSON.stringify(value.binding) === JSON.stringify(binding)).cursor;
+      } catch (error) {
+        if (!(error instanceof RecallError && error.code === "invalid_cursor")) throw error;
+        rawCursor = undefined; // restart from the resolved entry start
+      }
+    }
     let maximum = args.max_chars ?? 4000;
     let result: EvidenceReadResult;
     for (;;) {
       const { source_file: _file, session_id: _session, ...page } = readSourceEvidence(this.scope.id, source, {
-        entry_id: args.entry_id, before: binding.before, after: binding.after, cursor: rawCursor, maxChars: maximum,
+        entry_id: binding.entry, before: binding.before, after: binding.after, cursor: rawCursor, maxChars: maximum,
       });
       result = { ...page, next_cursor: page.next_cursor ? this.token("read", { binding, cursor: page.next_cursor }) : null };
       if (bytes(result) <= this.allowance(id)) break;
@@ -466,13 +511,33 @@ export class RepairProtocol {
   private propose(proposal: RepairProposal, id: string): unknown {
     for (const update of proposal.updates) if (!this.knownTopics.has(update.topicId)) invalid("An updated topic must first have been read.");
     if (proposal.merge && (!this.knownTopics.has(proposal.merge.leftTopicId) || !this.knownTopics.has(proposal.merge.rightTopicId))) invalid("Both merged topic cards must first have been read.");
-    const drafts = new Set(proposal.drafts.map(draft => draft.ref));
+    // Canonicalize draft refs by array order and remap move targets that cite them.
+    const draftRefMap = new Map(proposal.drafts.map((draft, index) => [draft.ref ?? `repair:${index}`, `repair:${index}`]));
+    for (const draft of proposal.drafts) draft.ref = draft.ref ?? draftRefMap.get(draft.ref!)!;
+    for (const move of proposal.moves) {
+      const mapped = move.targetRef.startsWith("repair:") ? draftRefMap.get(move.targetRef) : undefined;
+      if (mapped) move.targetRef = mapped;
+    }
+    const drafts = new Set([...draftRefMap.values()]);
     for (const move of proposal.moves) {
       const member = this.known.get(key(move));
-      if (!member || member.sourceHash !== move.sourceHash || member.topicId !== move.fromTopicRef) invalid("A moved facet must match a delivered initial membership and source revision.");
-      if (!this.knownTopics.has(move.targetRef) && !drafts.has(move.targetRef)) invalid("A move target must have been read or declared as a repair draft.");
+      if (!member) return { accepted: false, reason: `No delivered membership matches facet ${move.conversationId}/${move.facetId}. Read the topic members first.` };
+      if (member.sourceHash !== move.sourceHash || member.topicId !== move.fromTopicRef) {
+        return { accepted: false, reason: `Facet ${move.conversationId}/${move.facetId} was delivered with source ${member.sourceHash.slice(0, 8)} in ${member.topicId}, not ${move.sourceHash.slice(0, 8)} in ${move.fromTopicRef}.` };
+      }
+      if (!this.knownTopics.has(move.targetRef) && !drafts.has(move.targetRef)) return { accepted: false, reason: `Move target ${move.targetRef} was never read or declared as a draft.` };
     }
-    const normalized = this.registry.normalizeRepairProposal(this.selection, this.incoming, proposal, this.snapshot.revision);
+    let normalized;
+    try {
+      normalized = this.registry.normalizeRepairProposal(this.selection, this.incoming, proposal, this.snapshot.revision);
+    } catch (error) {
+      // Active-member violations are integrity failures and stay fatal; other malformed
+      // proposal shapes are model mistakes the child can retry.
+      if (error instanceof RecallError && error.code === "invalid_model_output" && !/active/i.test(error.message)) {
+        return { accepted: false, reason: error.message };
+      }
+      throw error;
+    }
     const unavailable = this.dependencies(normalized);
     if (unavailable.length) { this.active = undefined; return { accepted: false, unavailable }; }
     const proposalId = digest(JSON.stringify(["repair-plan-v1", this.viewId, normalized]));
@@ -484,7 +549,7 @@ export class RepairProtocol {
     this.bounded(result, id);
     this.active = { id: proposalId, proposal: normalized, targets, rejected: false };
     this.finishedChecks.clear();
-    for (const draft of normalized.drafts) this.knownTopics.add(draft.ref);
+    for (const draft of normalized.drafts) this.knownTopics.add(draft.ref ?? `repair:${normalized.drafts.indexOf(draft)}`);
     return result;
   }
 
@@ -500,9 +565,9 @@ export class RepairProtocol {
     if (target.pending) {
       if (args.cursor !== target.pending.cursor) invalid("Confirm the current proof page before advancing coverage.");
       this.records.set(id, { name: "repair_coverage", pageId: target.pending.id });
-      return this.coverageResult(active, target);
+      return this.bounded(this.coverageResult(active, target), id);
     }
-    if (target.complete) invalid("This coverage target has already reached confirmed EOF.");
+    if (target.complete) return this.bounded({ proposal_id: active.id, target_ref: target.targetRef, descriptor: target.descriptor, members: [], page_id: "complete", next_cursor: null, complete: true, member_count: target.count, digest: target.digest }, id);
     if (target.started && args.cursor !== target.nextCursor) invalid("Coverage cursor skipped or repeated a confirmed page.");
     if (!target.started && args.cursor !== undefined) throw new RecallError("invalid_cursor", "Coverage starts without a cursor.");
     let rawCursor: string | undefined;
@@ -537,9 +602,15 @@ export class RepairProtocol {
   private check(args: z.infer<typeof RepairCheckSchema>, id: string): unknown {
     const active = this.proposal(args.proposal_id);
     const previous = this.finishedChecks.get(args.page_id);
-    if (previous) { if (previous.fits !== JSON.stringify(args.fits)) invalid("A proof page cannot be confirmed differently twice."); return previous.result; }
+    if (previous) { return { ...previous.result, note: previous.fits !== JSON.stringify(args.fits) ? "This page was already confirmed; the original confirmation stands." : undefined }; }
     const target = active.targets.find(item => item.pending?.id === args.page_id);
-    if (!target?.pending) invalid("The proof page is not pending in the active proposal.");
+    if (!target?.pending) {
+      const anyTarget = args.target_ref ? active.targets.find(item => item.targetRef === args.target_ref) : undefined;
+      if (args.page_id === "complete" && anyTarget?.complete) {
+        return { checked: true, accepted: !active.rejected, member_count: anyTarget.count, digest: anyTarget.digest, complete: true, next_cursor: null };
+      }
+      invalid("The proof page is not pending in the active proposal.");
+    }
     const page = target.pending;
     const member = page.member;
     if (member) {
@@ -560,7 +631,7 @@ export class RepairProtocol {
     const result = { checked: true, accepted: !active.rejected, next_cursor: target.nextCursor, member_count: target.count, digest: target.digest, complete: target.complete };
     this.bounded(result, id);
     this.records.set(id, { name: "repair_check", pageId: page.id });
-    this.finishedChecks.set(page.id, { fits: JSON.stringify(args.fits), result });
+    this.finishedChecks.set(page.id, { fits: JSON.stringify(args.fits), result: result as Record<string, unknown> });
     return result;
   }
 
@@ -661,7 +732,9 @@ export class RepairProtocol {
 
   finalize(completion: RepairCompletion): ValidatedRepair {
     parse(RepairCompletionSchema, completion); this.input(); this.revision();
-    for (const member of this.auditMembers) if (!this.receipts.has(key(member))) invalid("Every healthy mandatory audit facet requires a complete original evidence receipt.");
+    for (const member of this.auditMembers) if (!this.receipts.has(key(member))) {
+      invalid("Every healthy mandatory audit facet requires a complete original evidence receipt.");
+    }
     let proposal: RepairProposal;
     let proposalId: string;
     let coverage: CoverageProof[];

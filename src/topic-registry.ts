@@ -110,8 +110,8 @@ export function extendCoverageDigest(previous: string, value: MemberFacet, recei
     value.descriptor, value.evidence, receipt.entryId, receipt.entryHash, receipt.totalChars]));
 }
 
-function invalidRepair(message: string): never {
-  throw new RecallError("invalid_model_output", message);
+function invalidRepair(message: string, code = "invalid_model_output"): never {
+  throw new RecallError(code, message);
 }
 
 function repairReason(value: string): string {
@@ -339,10 +339,12 @@ export class TopicRegistry {
       || proposal.drafts.length > 5 || proposal.updates.length > 5) invalidRepair("A repair proposal exceeds its draft or update limit.");
     const reason = repairReason(proposal.reason);
     const drafts = proposal.drafts.map((draft, index) => {
-      if (draft.ref !== `repair:${index}` || cards.has(draft.ref)) invalidRepair("Repair draft references must follow their array order.");
+      // Canonicalize model-chosen draft refs by array order; uniqueness via collision check.
+      const canonicalRef = `repair:${index}`;
+      if (cards.has(canonicalRef)) invalidRepair("Repair draft references must be unique.");
       const finalDescriptor = repairDescriptor(draft.descriptor);
-      cards.set(draft.ref, { id: draft.ref, ...finalDescriptor, createdAt: null });
-      return { ref: draft.ref, descriptor: finalDescriptor };
+      cards.set(canonicalRef, { id: canonicalRef, ...finalDescriptor, createdAt: null });
+      return { ref: canonicalRef, descriptor: finalDescriptor };
     });
     let merge: RepairState["merge"] = null;
     let merged: RepairProposal["merge"] = null;
@@ -466,7 +468,7 @@ export class TopicRegistry {
       targets.set(targetRef, target);
     };
     for (const update of state.proposal.updates) add(update.topicId, true);
-    for (const draft of state.proposal.drafts) add(draft.ref, true);
+    for (const [index, draft] of state.proposal.drafts.entries()) add(draft.ref ?? `repair:${index}`, true);
     if (state.merge) add(state.merge.survivor, true);
     for (const move of state.proposal.moves) add(move.targetRef, state.cards.get(move.targetRef)!.createdAt === null, key(move));
     return [...targets.values()].sort((left, right) => compareText(left.targetRef, right.targetRef));
@@ -625,16 +627,17 @@ export class TopicRegistry {
     }
     const proofPayload = (ref: string) => ({ coverage: proofs.get(canonical(ref)) ?? null, receipts: proofReceipts.get(canonical(ref)) ?? [] });
     const proofEvidence = (ref: string): EvidenceRef[] => (proofReceipts.get(canonical(ref)) ?? []).map(receipt => ({ id: receipt.entryId, hash: receipt.entryHash }));
-    for (const draft of [...plan.selection.newTopics, ...state.proposal.drafts]) {
-      if (!this.repairMembers(state, incoming, [draft.ref], 1).length) continue;
+    for (const [draftIndex, draft] of [...plan.selection.newTopics, ...state.proposal.drafts].entries()) {
+      const draftRef = draft.ref ?? `repair:${draftIndex}`;
+      if (!this.repairMembers(state, incoming, [draftRef], 1).length) continue;
       const id = `t_${randomUUID()}`;
-      refs.set(draft.ref, id);
+      refs.set(draftRef, id);
       this.db.query("INSERT INTO hr_topics(scope_id,id,title,description,aliases,created_at,updated_at,review_cursor) VALUES (?,?,?,?,?,?,?,NULL)")
         .run(this.scopeId, id, draft.descriptor.title, draft.descriptor.description, JSON.stringify(draft.descriptor.aliases), now, now);
       this.event(revision, "create", id, incoming.id, {
-        repair_id: repairId, draft_ref: draft.ref, before: null, after: { id, ...draft.descriptor }, reason: state.proposal.reason,
-        evidence: proofs.has(draft.ref) ? proofEvidence(draft.ref) : evidence(state.incoming.filter(value => value.topicId === draft.ref)),
-        ...proofPayload(draft.ref),
+        repair_id: repairId, draft_ref: draftRef, before: null, after: { id, ...draft.descriptor }, reason: state.proposal.reason,
+        evidence: proofs.has(draftRef) ? proofEvidence(draftRef) : evidence(state.incoming.filter(value => value.topicId === draftRef)),
+        ...proofPayload(draftRef),
       }, now);
       counts.created++;
     }
