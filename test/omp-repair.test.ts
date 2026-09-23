@@ -2,7 +2,7 @@ import { expect, it, setSystemTime } from "bun:test";
 import { z } from "zod";
 import { openHistoryDatabase } from "../src/database";
 import { inputBudget } from "../src/chunking";
-import { createRuntimeFixture, nativeToolReply, streamReply, type NativeBoundaryResult } from "./runtime-fixture";
+import { createRuntimeFixture, nativeToolReply, streamReply } from "./runtime-fixture";
 
 it("executes restricted native evidence tools and preserves the parent after child disposal", async () => {
   let parentToolNames: (() => string[]) | undefined;
@@ -95,25 +95,17 @@ it("does not hide unknown non-null fields when normalizing valid transport nulls
   } finally { await fixture.close(); }
 }, 120_000);
 
-it("resumes one-call batches by replaying native responses and rebuilding complete receipts", async () => {
+it("replays cached native responses while rebuilding complete receipts", async () => {
   const fixture = await createRuntimeFixture({ seedConversations: false });
   try {
-    let result: NativeBoundaryResult | undefined;
-    let attempts = 0;
-    for (; attempts < 30; attempts++) {
-      const before = fixture.nativeRequests.length;
-      try { result = await fixture.runNativeBoundary({ maxCalls: 1 }); }
-      catch (error) { expect(error).toMatchObject({ code: "work_budget" }); }
-      expect(fixture.nativeRequests.length - before).toBe(1);
-      if (result) break;
-    }
-    expect(result?.repair.receipts).toHaveLength(1);
-    expect(result?.repair.coverage).toMatchObject([{ targetRef: "repair:0", memberCount: 1 }]);
-    expect(attempts).toBeGreaterThan(0);
+    const result = await fixture.runNativeBoundary();
+    expect(result.repair.receipts).toHaveLength(1);
+    expect(result.repair.coverage).toMatchObject([{ targetRef: "repair:0", memberCount: 1 }]);
     const requests = fixture.nativeRequests.length;
-    const replay = await fixture.runNativeBoundary({ maxCalls: 1 });
+    expect(result.calls).toBe(requests);
+    const replay = await fixture.runNativeBoundary();
     expect(replay.calls).toBe(0);
-    expect(replay.repair).toEqual(result!.repair);
+    expect(replay.repair).toEqual(result.repair);
     expect(fixture.nativeRequests.length).toBe(requests);
     expect(fixture.errors).toEqual([]);
   } finally { await fixture.close(); }
@@ -240,7 +232,7 @@ it("keeps long evidence partial until native remember and cursor reads reach its
     const finalCorrection = "Final correction: acknowledgements remain blocked until fsync succeeds.";
     const text = "WAL fsync failed; writes must not be acknowledged. ".repeat(1400) + finalCorrection;
     expect(text.length).toBeGreaterThan(inputBudget(fixture.model.contextWindow, fixture.model.maxOutputTokens));
-    const result = await fixture.runNativeBoundary({ text, maxCalls: 1000 });
+    const result = await fixture.runNativeBoundary({ text });
     expect(result.repair.coverage).toMatchObject([{ memberCount: 1 }]);
     const reads = fixture.nativeToolCalls.filter(call => call.name === "repair_read" && call.args.action === "read");
     expect(reads.length).toBeGreaterThan(1);

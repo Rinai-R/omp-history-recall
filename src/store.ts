@@ -12,7 +12,7 @@ import { enumerateSources, validateSourceFile, type RecallScope, type SourceAcce
 import { TopicRegistry } from "./topic-registry";
 import { selectTopics, TOPIC_VERSION, type ClusterPlan, type IncomingConversation, type TopicChangeCounts } from "./topics";
 import { ModelBudget } from "./model-budget";
-import { RepairProtocol, type DeferredRepair, type RepairRunner } from "./repair";
+import { RepairProtocol, type DeferredRepair, type RepairCompletion, type RepairRunner } from "./repair";
 import { inputBudget } from "./chunking";
 
 type Job = { file: string; stamp: string; attempts: number; token: string };
@@ -32,7 +32,11 @@ export type CatalogResult = { scope_id: string; conversations: CatalogEntry[]; n
 export type DiscoveryResult = { scope_id: string; discovered: number; queued: number; warnings: SourceWarning[] };
 export type BrowseOptions = TimeFilter & { topic_id?: string; cursor?: string; limit?: number };
 export type IndexResult = { completed: number; failed: number; calls: number; errors: { file: string; code: string }[]; topic_changes: TopicChangeCounts; repair_deferred: DeferredRepair[] };
-export type WorkOptions = { file?: string; maxJobs?: number; maxCalls?: number; concurrency?: number; signal?: AbortSignal };
+export type WorkProgress = {
+  stage: "reading" | "analysis" | "selection" | "preparing_repair" | "repair" | "validating" | "publishing" | "completed" | "failed";
+  file: string; job: number; completed: number; failed: number; calls: number; code?: string;
+};
+export type WorkOptions = { file?: string; concurrency?: number; signal?: AbortSignal; onProgress?: (progress: WorkProgress) => void };
 
 function browseCursor(value: string, binding: string): { offset: number; range: TimeRange } {
   try {
@@ -189,14 +193,13 @@ export class HistoryStore {
     return { scope_id: this.scope.id, discovered: selected.length, queued, warnings };
   }
 
-  private claim(file?: string): Job | null {
+  private claim(file: string): Job | null {
     const now = Date.now();
     return this.db.transaction(() => {
-      const job = this.db.query<Omit<Job, "token">, [string, string | null, string | null, number, number]>(
+      const job = this.db.query<Omit<Job, "token">, [string, string, number]>(
         `SELECT file,stamp,attempts FROM hr_jobs
-         WHERE scope_id=? AND (? IS NULL OR file=?) AND attempts<3 AND retry_at<=? AND lease_until<=?
-         ORDER BY file LIMIT 1`)
-        .get(this.scope.id, file ?? null, file ?? null, now, now);
+         WHERE scope_id=? AND file=? AND lease_until<=?`)
+        .get(this.scope.id, file, now);
       if (!job) return null;
       const token = randomUUID();
       this.db.run("UPDATE hr_jobs SET token=?,lease_until=? WHERE scope_id=? AND file=?",
@@ -207,26 +210,31 @@ export class HistoryStore {
 
   async work(model: JsonModel, repair: RepairRunner, options: WorkOptions = {}): Promise<IndexResult> {
     const concurrency = validateConcurrency(options.concurrency);
-    const maxJobs = options.maxJobs ?? 1;
-    const maxCalls = options.maxCalls ?? 12;
-    for (const value of [maxJobs, maxCalls]) {
-      if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) throw new RecallError("invalid_budget", "Work budgets must be integers between 1 and 10000.");
-    }
     if (options.file !== undefined && !path.isAbsolute(options.file)) throw new RecallError("invalid_file", "Use an absolute source_file from the catalog.");
     const modelBinding = [model.identity, model.contextWindow, model.maxOutputTokens];
-    const budget = new ModelBudget(this.db, this.scope.id, { maxCalls });
+    const budget = new ModelBudget(this.db, this.scope.id);
     const budgeted = budget.wrapJson(model, input => {
       const stage = input && typeof input === "object" && "stage" in input ? input.stage : undefined;
       return typeof stage === "string" && stage.startsWith("analysis_") ? SEMANTIC_VERSION : TOPIC_VERSION;
     });
-    let completed = 0, failed = 0;
+    let completed = 0, failed = 0, claimed = 0;
     const errors: IndexResult["errors"] = [];
     const deferred = new Map<string, DeferredRepair>();
     const topic_changes: TopicChangeCounts = { created: 0, updated: 0, merged: 0, reassigned: 0 };
-    for (let index = 0; index < maxJobs; index++) {
+    // Freeze this invocation's queue so failures and newly discovered files wait
+    // for the next explicit attempt rather than extending this run indefinitely.
+    const files = this.db.query<{ file: string }, [string, string | null, string | null]>(
+      "SELECT file FROM hr_jobs WHERE scope_id=? AND (? IS NULL OR file=?) ORDER BY file")
+      .all(this.scope.id, options.file ?? null, options.file ?? null);
+    for (const { file } of files) {
       options.signal?.throwIfAborted();
-      const job = this.claim(options.file);
-      if (!job) break;
+      const job = this.claim(file);
+      if (!job) continue;
+      claimed++;
+      const progress = (stage: WorkProgress["stage"], code?: string): void => {
+        try { options.onProgress?.({ stage, file: job.file, job: claimed, completed, failed, calls: budget.calls, code }); }
+        catch { /* Progress observers must not affect indexing. */ }
+      };
       const heartbeat = setInterval(() => {
         try { if (!this.closed) this.db.run("UPDATE hr_jobs SET lease_until=? WHERE scope_id=? AND file=? AND token=?",
           [Date.now() + 120_000, this.scope.id, job.file, job.token]); }
@@ -234,10 +242,12 @@ export class HistoryStore {
       }, 30_000);
       heartbeat.unref();
       try {
+        progress("reading");
         await validateSourceFile(job.file, (await this.sources(options.signal)).files, options.signal);
         const source = await loadSource(job.file, { signal: options.signal });
         if (source.sessionId === this.excludedSessionId) throw new RecallError("invalid_file", "The active session cannot be indexed.");
         await this.checkSourceIdentity(source);
+        progress("analysis");
         const facts = conversationFacts(source);
         const cacheKey = digest(JSON.stringify([this.scope.id, "analysis", SEMANTIC_VERSION, modelBinding, source.fingerprint]));
         const cached = this.db.query<{ payload: string }, [string, string]>(
@@ -260,15 +270,22 @@ export class HistoryStore {
         };
         const snapshot = this.registry.snapshot();
         const modelOptions = { signal: options.signal, concurrency };
+        progress("selection");
         const selection = await selectTopics(budgeted, analysis, snapshot.cards, modelOptions);
+        progress("preparing_repair");
         const protocol = new RepairProtocol(this.scope, this.registry, incoming, source, selection, snapshot,
           (id, signal) => this.readRepairSource(id, snapshot.revision, signal),
           { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens), concurrency });
         protocol.bindModel(model);
         await protocol.prepare(options.signal);
-        const completion = protocol.hasUsableHistory
-          ? await repair({ protocol, budget, signal: options.signal, concurrency })
-          : { proposal_id: null, reason: "No available indexed historical members require maintenance." };
+        let completion: RepairCompletion;
+        if (protocol.hasUsableHistory) {
+          progress("repair");
+          completion = await repair({ protocol, budget, signal: options.signal, concurrency });
+        } else {
+          completion = { proposal_id: null, reason: "No available indexed historical members require maintenance." };
+        }
+        progress("validating");
         const validated = protocol.finalize(completion);
         const plan: ClusterPlan = { expectedRevision: snapshot.revision, selection, repair: validated };
         // Never reuse protocol evidence reads here: every used source is checked anew.
@@ -298,16 +315,22 @@ export class HistoryStore {
         }
         await this.checkSourceIdentity(current);
         options.signal?.throwIfAborted();
+        progress("publishing");
         const changes = this.publish(current, facts, incoming, plan, model.identity, job);
         for (const key of ["created", "updated", "merged", "reassigned"] as const) topic_changes[key] += changes[key];
         for (const warning of protocol.deferred()) deferred.set(JSON.stringify([warning.conversation_id, warning.code]), warning);
         completed++;
+        progress("completed");
       } catch (error) {
         const code = error instanceof RecallError ? error.code : options.signal?.aborted ? "cancelled" : "index_error";
         this.releaseJob(job, code);
-        if (options.signal?.aborted) throw error;
+        if (options.signal?.aborted) {
+          progress("failed", code);
+          throw error;
+        }
         failed++;
         errors.push({ file: job.file, code });
+        progress("failed", code);
       } finally { clearInterval(heartbeat); }
     }
     return { completed, failed, calls: budget.calls, errors, topic_changes, repair_deferred: [...deferred.values()] };
@@ -353,7 +376,7 @@ export class HistoryStore {
 
 
   private releaseJob(job: Job, code: string): void {
-    const retryable = ["cancelled", "work_budget", "source_busy", "topic_state_changed"].includes(code);
+    const retryable = ["cancelled", "source_busy", "topic_state_changed"].includes(code);
     const now = Date.now();
     const retryAt = now + (retryable ? 1000 : 30_000 * (job.attempts + 1));
     this.db.run(`UPDATE hr_jobs SET token='',lease_until=0,attempts=attempts+?,error=?,retry_at=? WHERE scope_id=? AND file=? AND token=?`,

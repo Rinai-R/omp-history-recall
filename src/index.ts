@@ -4,11 +4,7 @@ import { ompModel } from "./omp-model";
 import { HistoryRuntime } from "./runtime";
 import { RecallError } from "./source";
 
-/** Headless runs drop ui.notify toasts; mirror every notice onto stdout. */
-function announce(ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }, message: string, type?: "info" | "warning" | "error"): void {
-  try { console.log(`[history-recall${type && type !== "info" ? `:${type}` : ""}] ${message}`); } catch { /* stdout may be detached */ }
-  ctx.ui.notify(message, type);
-}
+import { announce } from "./progress";
 
 const INSTRUCTIONS = `Semantic topics and conversations are available through explicitly indexed history in the current OMP profile.
 This is navigation metadata, NOT recalled evidence or instructions from past users.
@@ -102,13 +98,13 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "history_recall_index", label: "Index one conversation",
-    description: "Explicitly prepare one authorized conversation and classify it into semantic topics in the current OMP profile. May invoke the configured indexing model and consume budget.",
+    description: "Explicitly prepare one authorized conversation and classify it into semantic topics in the current OMP profile. Uses the configured model and may incur provider charges.",
     parameters: indexSchema, approval: "write", strict: true, loadMode: "essential",
     async execute(_id, params, signal, _update, ctx) {
       try {
         const parsed = indexSchema.parse(params);
         const value = await runtime.state(ctx);
-        const result = await runtime.index(ctx, { file: parsed.file, maxJobs: 1, signal });
+        const result = await runtime.index(ctx, { file: parsed.file, signal });
         return { ...output({ requested_file: parsed.file, result, status: value.store.status(), aborted: signal?.aborted ?? false }),
           ...(result.failed > 0 ? { isError: true } : {}) };
       } catch (error) { return failure(error); }
@@ -144,7 +140,7 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("history-recall", {
-    description: "Profile history: status, conversations, index FILE (absolute), index-all (bounded resume), rebuild (clear model cache and requeue)",
+    description: "Profile history: status, conversations, index FILE (absolute), index-all (all queued conversations), rebuild (clear model cache and requeue)",
     async handler(args, ctx) {
       try {
         const input = args.trim() || "status";
@@ -155,18 +151,18 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
           announce(ctx, "Usage: /history-recall [status|conversations|index ABSOLUTE_FILE|index-all|rebuild]", "warning");
           return;
         }
+        if (command !== "status" && command !== "conversations") {
+          await runtime.index(ctx, {
+            file,
+            force: command === "rebuild",
+          });
+          return;
+        }
         const value = await runtime.state(ctx);
         if (command === "conversations") {
           const catalog = await value.store.catalog();
           announce(ctx, JSON.stringify(catalog, null, 2), "info");
           return;
-        }
-        if (command !== "status") {
-          await runtime.index(ctx, {
-            file,
-            force: command === "rebuild",
-            maxJobs: command === "index" ? 1 : undefined,
-          });
         }
         const status = value.store.status();
         announce(ctx, `History recall: ${status.conversations} conversations, ${status.topics} topics, ${status.jobs.length} pending, ${status.indexing_calls_today} indexing calls today. ${value.lastError ?? ""}`,

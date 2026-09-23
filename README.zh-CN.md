@@ -90,7 +90,7 @@ Latest: ...
 
 显式索引在存在可用已索引历史时自动运行受限的 OMP 原生 child。它先读取原文，再提出定义更新、错误归属移动、重复主题合并或按已有 facets 拆分；一次完整取证即可提交，不再等待第二条会话投票。每次最多 audit 八个历史 facets、移动八个历史和五个 incoming facets、创建五个额外 repair drafts、合并一对持久主题。修改定义或合并必须逐个验证全部最终成员，并确认分页 EOF。主题变化不改写原始 entries、FTS 或证据身份。
 
-六个 `repair_*` 工具只存在于索引 child，普通父会话的工具目录不可见。模型与工具循环由原生 OMP 执行，插件不自建 agent loop。Child 使用与分析、初选相同的已捕获模型和共享调用额度；没有空闲维护定时器。没有已索引历史时，短会话首次索引仍只需一次内容分析调用。
+六个 `repair_*` 工具只存在于索引 child，普通父会话的工具目录不可见。模型与工具循环由原生 OMP 执行，插件不自建 agent loop。Child 使用与分析、初选相同的已捕获模型和调用用量统计；没有空闲维护定时器。没有已索引历史时，短会话首次索引仍只需一次内容分析调用。
 
 维护开始前已经缺失、不可读或陈旧的来源通过 `repair_deferred` 返回，不能参与 proof，也不能修改或合并包含它们的主题；其他健康成员的独立归属仍可修复。来源一旦确认健康或交付过原文，之后变化会导致整次发布失败。Incoming 索引与历史修复同事务提交，不会在维护失败后单独发布 incoming。
 
@@ -106,7 +106,7 @@ Latest: ...
 | `history_recall_search` | 用 1-8 个 query 数组搜索原文，支持 topic/会话/时间过滤，返回命中 entry ID |
 | `history_recall_read_conversation` | 分页读取 active branch，或用命中 `entry_id` 加 `before`/`after` 返回同分支最近上下文 |
 
-浏览和列表不调用模型。已索引、未变化且未排队的文件直接跳过。短会话内容分析使用一次请求，长会话使用无损切块和有界分层 reduce；主题选择按字节分页比较完整目录。分析、初选和每次未缓存的原生 repair 请求共享硬额度，失败请求计费、缓存命中不计费。原生缓存重放仍重新执行真实取证工具、生成 receipts 并验证后才能发布。主题变化不会重发已缓存的原文分析。搜索可能调用一次查询改写，失败时降级为词项搜索。
+浏览和列表不调用模型。已索引、未变化且未排队的文件直接跳过。短会话内容分析使用一次请求，长会话使用无损切块和有界分层 reduce；主题选择按字节分页比较完整目录。分析、初选和原生 repair 请求共享用量统计，插件不设每日或单次命令的调用次数上限；失败请求计数，缓存命中不计数。原生缓存重放仍执行真实取证工具、重建 receipts 并验证后才能发布。主题变化不会重发已缓存的原文分析。搜索可能调用一次查询改写，失败时降级为词项搜索。
 
 时间过滤支持 `days`，或包含的 `from` 加不包含的 `to`。纯日期表示 UTC 零点；本地自然日请带时区偏移。若命中 entry 有多个子分支，聚焦上下文只沿一条连续后代路径返回，并单独列出其他分支入口，不会静默合并 sibling branches。
 
@@ -117,10 +117,12 @@ Latest: ...
 | `/history-recall status` | 数量、待处理任务和今日索引调用 |
 | `/history-recall conversations` | 已索引与未索引源文件 |
 | `/history-recall index FILE` | 索引一个绝对来源路径；bare `index` 返回 usage |
-| `/history-recall index-all` | 发现当前 profile 授权来源并显式处理有界批次 |
-| `/history-recall rebuild` | 清当前 profile 的模型缓存并 force 重新排队，保留主题 ID 和 daily quota |
+| `/history-recall index-all` | 发现授权来源，并处理本次命令开始时捕获的整个待索引队列 |
+| `/history-recall rebuild` | 清当前 profile 的模型缓存并 force 重新排队，保留主题 ID 和用量统计 |
 
-没有空闲后台索引器。未完成任务使用 `index-all` 续跑；重复 `rebuild` 会清除缓存进度。命令拒绝多余参数。
+没有空闲后台索引器。一次显式命令对快照中的每个文件尝试一次，跳过仍被其他进程持有 lease 的任务；单个文件失败后保留在队列，继续处理后续文件，下次显式命令可再尝试，不受历史重试次数或退避时间阻挡。快照之后新增的任务留到下次命令。取消会保留未完成任务。不再有“两条会话、十二次调用”的批次截断。重复 `rebuild` 会清除缓存进度；命令拒绝多余参数。
+
+交互式 TUI 会在发现来源/调用模型前，于输入框上方显示实时进度面板：转圈动效、当前文件和阶段、耗时、实际处理/提交数量、剩余队列与模型调用数。进度条不伪造模型思考百分比。完成、失败或取消后立即停止动画、清空底部状态栏，精简结果面板三秒后自动收起；新任务和会话退出都会取消旧面板的定时器。Print 模式按阶段向 stderr 输出进展，向 stdout 输出最终摘要，不刷动画日志。
 
 ## 隐私与边界
 
@@ -140,11 +142,9 @@ Latest: ...
 | `OMP_HISTORY_RECALL_DISABLED` | 不设置 | `1` 重启后禁用 |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | SQLite 物理路径；共享 override 仍按 profile 隔离，相对路径按启动 cwd 解析一次 |
 | `OMP_HISTORY_RECALL_MODEL` | 当前 OMP 模型 | 索引/查询改写模型 |
-| `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | 显式批处理最大会话数 |
-| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | 每次 `index-all` 的未缓存模型调用 |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | 分析/初选调用与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `32` | 分析/初选调用与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
 
-每次分析/初选请求和原生模型 turn 期限为 90 秒，不是整个会话索引的总期限；查询改写期限 30 秒。失败任务保留已校验的请求进度。取消、incoming 来源变化、并发 topic 状态变化及额度耗尽不累计失败次数。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布是原子的，不提交半份会话或主题变化；重试须由显式批次触发。
+仍保留请求超时、来源/证据校验、上下文大小与并发控制；这些不是调用次数配额。失败任务保留已校验的请求进度，可以在下一次显式命令中再次尝试。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布保持原子性，不提交半份会话或主题变化。
 
 取消后仍持有 lease，直到已开始的 provider 请求、原文读取和 child 销毁全部结束。OMP 18.2.6 在模型 hook 前还有一次 SDK 自有认证预检，该 lookup 没有取消信号参数；插件立即锁存取消、阻止后续 provider 请求，并等该预检结束，不修改共享 model registry 或关闭父会话认证存储。
 

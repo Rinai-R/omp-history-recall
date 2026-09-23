@@ -1,17 +1,13 @@
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import * as path from "node:path";
-import { ompModel, resolveRecallModel } from "./omp-model";
+import { ompModel, resolveRecallModel, type ModelMetric } from "./omp-model";
 import { ompRepairRunner } from "./omp-repair";
 import { RecallError } from "./source";
 import { HistoryStore, type IndexResult } from "./store";
 import { DEFAULT_INDEX_CONCURRENCY, validateConcurrency } from "./concurrency";
 import { resolveRecallScope } from "./scope";
 
-/** Headless runs drop ui.notify toasts; mirror every notice onto stdout. */
-function announce(ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }, message: string, type?: "info" | "warning" | "error"): void {
-  try { console.log(`[history-recall${type && type !== "info" ? `:${type}` : ""}] ${message}`); } catch { /* stdout may be detached */ }
-  ctx.ui.notify(message, type);
-}
+import { announce, IndexProgress } from "./progress";
 
 const STARTUP_CWD = process.cwd();
 type SessionState = {
@@ -20,22 +16,15 @@ type SessionState = {
   worker?: Promise<IndexResult>;
   controller?: AbortController;
   lastError?: string;
+  progress?: IndexProgress;
 };
 
 type IndexOptions = {
   file?: string;
   force?: boolean;
-  maxJobs?: number;
   signal?: AbortSignal;
 };
 
-function budget(name: string, fallback: number): number {
-  const value = Number(process.env[name] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) {
-    throw new RecallError("invalid_budget", `${name} must be an integer from 1 to 10000.`);
-  }
-  return value;
-}
 
 /** Owns per-session stores and indexing cancellation; tool registration stays in index.ts. */
 export class HistoryRuntime {
@@ -83,36 +72,43 @@ export class HistoryRuntime {
     const controller = new AbortController();
     const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
     state.controller = controller;
+    state.lastError = undefined;
+    state.progress?.dispose();
+    const progress = new IndexProgress(ctx);
+    state.progress = progress;
+    const onCancel = () => progress.cancelling();
+    signal.addEventListener("abort", onCancel, { once: true });
     const run = async (): Promise<IndexResult> => {
       signal.throwIfAborted();
       if (options.force) state.store.clearSemanticCache();
       await state.store.discover({ file, force: options.force, signal });
       const selected = resolveRecallModel(ctx);
-      const observe = (metric: Parameters<HistoryStore["recordModelCall"]>[1]) => state.store.recordModelCall("index", metric);
+      const pending = state.store.status().jobs;
+      progress.setQueue(pending.filter(job => (file === undefined || job.file === file) && job.lease_until <= Date.now()).length,
+        pending.length, `${selected.provider}/${selected.id}`);
+      const observe = (metric: ModelMetric) => {
+        progress.modelCall();
+        state.store.recordModelCall("index", metric);
+      };
       const model = ompModel(ctx, observe, selected);
       const repair = ompRepairRunner(ctx, observe, selected);
       return state.store.work(model, repair, {
         file,
-        maxJobs: options.maxJobs ?? budget("OMP_HISTORY_RECALL_BATCH_SESSIONS", file ? 1 : 2),
-        maxCalls: budget("OMP_HISTORY_RECALL_BATCH_CALLS", 12),
         concurrency,
         signal,
+        onProgress: update => progress.update(update),
       });
     };
     state.worker = run().then(result => {
-      const code = result.errors.at(-1)?.code;
-      if (code && code !== state.lastError) {
-        announce(ctx, `History indexing: ${code}; progress is retained. See /history-recall status.`, "warning");
-      }
-      if (result.repair_deferred.length) {
-        announce(ctx, `History repair: ${result.repair_deferred.length} historical sources are not yet available for repair; the complete history has not been repaired.`, "warning");
-      }
-      state.lastError = code;
+      state.lastError = result.errors.at(-1)?.code;
+      progress.finish(result, state.store.status().jobs.length);
       return result;
     }).catch(error => {
       state.lastError = signal.aborted ? "cancelled" : error instanceof RecallError ? error.code : "history_unavailable";
+      progress.fail(state.lastError);
       throw error;
     }).finally(() => {
+      signal.removeEventListener("abort", onCancel);
       state.worker = undefined;
       state.controller = undefined;
     });
@@ -120,7 +116,11 @@ export class HistoryRuntime {
   }
 
   cancel(ctx: ExtensionContext): void {
-    for (const state of this.states.values()) if (state.sessionId === ctx.sessionManager.getSessionId()) state.controller?.abort();
+    for (const state of this.states.values()) {
+      if (state.sessionId !== ctx.sessionManager.getSessionId()) continue;
+      state.controller?.abort();
+      if (!state.worker) { state.progress?.dispose(); state.progress = undefined; }
+    }
   }
 
   async dispose(ctx: ExtensionContext): Promise<void> {
@@ -147,5 +147,7 @@ export class HistoryRuntime {
   private async stop(state: SessionState): Promise<void> {
     state.controller?.abort();
     try { await state.worker; } catch { /* The original caller receives the failure. */ }
+    state.progress?.dispose();
+    state.progress = undefined;
   }
 }

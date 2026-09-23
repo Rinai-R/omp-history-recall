@@ -301,7 +301,7 @@ describe("conversation semantics", () => {
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency: 3 });
       const released = new Set<number>();
       const lastId = loaded.entries.at(-1)!.id;
       const respond = (index: number) => {
@@ -351,7 +351,7 @@ describe("conversation semantics", () => {
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency: 3 });
       const outcome = run.then(() => ({ error: undefined, active: controlled.active, invalidated: [...controlled.invalidated] }),
         (error: unknown) => ({ error, active: controlled.active, invalidated: [...controlled.invalidated] }));
       const [first, valid, invalid] = controlled.calls;

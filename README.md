@@ -90,7 +90,7 @@ Accessible sources are the profile's managed sessions and immediate buckets, the
 
 Explicit indexing automatically runs a restricted native OMP child when usable indexed history exists. It reads original evidence before proposing definition updates, historical reassignments, duplicate-topic merges, or facet-based splits. One complete evidence review can publish a repair; no second-conversation vote is required. Each run audits at most eight historical facets, moves at most eight historical and five incoming facets, creates at most five repair drafts, and merges at most one persisted pair. Changed definitions and merges require every final member to pass singleton coverage checks, including explicit end-of-pagination confirmation. Renames, moves and merges leave original entries, FTS rows and evidence identities unchanged.
 
-The six `repair_*` tools exist only in the indexing child, not in the ordinary parent conversation's tool directory. OMP owns its model/tool loop; the extension does not run a separate agent loop. The child uses the same captured model and shared call budget as analysis and topic selection. There is no idle repair timer. A short first conversation with no indexed history still needs only its content-analysis call.
+The six `repair_*` tools exist only in the indexing child, not in the ordinary parent conversation's tool directory. OMP owns its model/tool loop; the extension does not run a separate agent loop. The child uses the same captured model and shared usage accounting as analysis and topic selection. There is no idle repair timer. A short first conversation with no indexed history still needs only its content-analysis call.
 
 Sources already missing, unreadable or stale before repair are reported in `repair_deferred`; they cannot support a repair proof or a definition change/merge of their topics. Other healthy memberships can still be repaired. Once evidence has been used or a source confirmed healthy, subsequent changes fail the whole publication. Incoming indexing and historical repair commit in one transaction; repair failure never publishes incoming state alone.
 
@@ -106,7 +106,7 @@ The derived database uses schema 5, without a vote table. Schema 4, schema 3 and
 | `history_recall_search` | Searches original text with an array of 1-8 queries, optional topic/conversation/time filters, and returns matched entry IDs |
 | `history_recall_read_conversation` | Pages the active branch, or returns recent same-branch context around a matched `entry_id` using `before`/`after` |
 
-Browsing and listing do not invoke a model. Unchanged indexed files are skipped unless already queued. Content analysis uses one request for short conversations and lossless chunks with bounded hierarchical reduction for longer ones. Topic selection compares the full catalog through byte-bounded pages. Analysis, selection and each uncached native repair request share the same hard call budgets; failed requests count, cache hits do not. Cached native responses replay the real tools and rebuild evidence receipts before publication. Topic changes do not resend cached source analysis. Search may invoke one query-rewrite call and falls back to lexical search if it fails.
+Browsing and listing do not invoke a model. Unchanged indexed files are skipped unless already queued. Content analysis uses one request for short conversations and lossless chunks with bounded hierarchical reduction for longer ones. Topic selection compares the full catalog through byte-bounded pages. Analysis, selection and native repair requests share usage accounting, not a call quota: the plugin imposes no daily or per-invocation call cap. Failed requests count and cache hits do not. Cached native responses replay the real tools and rebuild evidence receipts before publication. Topic changes do not resend cached source analysis. Search may invoke one query-rewrite call and falls back to lexical search if it fails.
 
 Time filters use `days`, or inclusive `from` plus exclusive `to`. Date-only values mean UTC midnight; use an explicit offset for a local calendar day. If an entry has multiple child branches, focused context follows one contiguous descendant path and reports other branch entry IDs separately instead of silently merging sibling branches.
 
@@ -117,10 +117,12 @@ Time filters use `days`, or inclusive `from` plus exclusive `to`. Date-only valu
 | `/history-recall status` | Counts, pending jobs and today's metered indexing calls (usage display only, no cap) |
 | `/history-recall conversations` | Indexed and unindexed source candidates |
 | `/history-recall index FILE` | Index one selected absolute source path; bare `index` returns usage |
-| `/history-recall index-all` | Discover authorized profile sources and explicitly process a bounded batch |
-| `/history-recall rebuild` | Clear this profile's model cache and force-requeue authorized sources, preserving topic IDs and daily quota |
+| `/history-recall index-all` | Discover authorized sources and process the entire queue captured for this invocation |
+| `/history-recall rebuild` | Clear this profile's model cache and force-requeue authorized sources, preserving topic IDs and usage counters |
 
-There is no idle background indexer. Continue unfinished work with `index-all`; repeating `rebuild` discards cached progress. Commands reject extra arguments.
+There is no idle background indexer. Each explicit invocation attempts every captured file once, skips live leases, and continues past per-file failures. Failed files remain queued for the next explicit invocation; past retry metadata does not block it. New arrivals after the snapshot wait for the next command. Cancellation retains unfinished work. There is no two-conversation or twelve-call batch cutoff. Repeating `rebuild` discards cached progress. Commands reject extra arguments.
+
+In the interactive TUI, indexing opens a live panel above the editor before discovery/model work. It shows animated activity, the current file and stage, elapsed time, processed/committed counts, remaining queue and model calls. The bar measures actual processed work items, not a guessed percentage of model reasoning. Completion, failure or cancellation stops animation and clears the footer status immediately; the compact result panel disappears after three seconds. A new run or session teardown cancels the previous panel's timer. Print mode emits stage updates to stderr and the final summary to stdout, without animation output.
 
 ## Privacy and Limits
 
@@ -140,15 +142,13 @@ There is no idle background indexer. Continue unfinished work with `index-all`; 
 | `OMP_HISTORY_RECALL_DISABLED` | unset | `1` disables the extension after restart |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | Physical SQLite path; a shared override still isolates profiles, and relative overrides resolve once against startup cwd |
 | `OMP_HISTORY_RECALL_MODEL` | current OMP model | Indexing/query-rewrite model |
-| `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | Maximum conversations in an explicit batch |
-| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | Uncached model calls per `index-all` invocation |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | Maximum concurrent analysis/selection calls and repair source reads; integer 1–32. Native repair model turns are sequential. |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `32` | Maximum concurrent analysis/selection calls and repair source reads; integer 1–32. Native repair model turns are sequential. |
 
-Each analysis/selection request and native model turn has a 90-second deadline; this is not a whole-conversation deadline. Query rewrite has a 30-second deadline. Failed jobs retain validated request progress. Cancellation, incoming-source changes, concurrent topic-state changes and an exhausted batch budget does not count toward the three-failure limit. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes. Retries require explicit batches.
+Request timeouts, source/evidence validation, context-size bounds and concurrency controls remain in place; they are not model-call quotas. Failed jobs retain validated request progress and can be attempted again by an explicit command. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes.
 
 Cancellation retains the lease until admitted provider requests, source reads and child disposal settle. OMP 18.2.6 also performs an SDK-owned authentication preflight before its model hooks; that lookup has no cancellation-signal parameter. Cancellation is latched immediately, prevents subsequent provider dispatch, and waits for this preflight to settle without mutating the shared model registry or closing parent authentication storage.
 
-For example, `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` allows up to six analysis/selection calls or source reads, not six simultaneous child model turns.
+For example, `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` lowers concurrent analysis/selection calls or source reads to six; the default is 32. Native repair model turns stay sequential.
 
 ## Verification
 

@@ -13,6 +13,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { ensureThemeSync, ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
+import type { ExtensionUiComponent } from "@oh-my-pi/pi-tui/chat/extension-types";
 import { __resetDirsFromEnvForTests, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 import { HistoryStore } from "../src/store";
 import { digest, loadSource } from "../src/source";
@@ -95,14 +97,19 @@ export type SelectionMode = "normal" | "collapse" | "distinct";
 export type NativeRepairMode = "keep" | "split" | "merge" | "merge_stream" | "boundary";
 export type FixtureNativeCall = { name: string; args: Record<string, unknown> };
 export type FixtureNativeResult = FixtureNativeCall & { id: string; value: Record<string, unknown> };
+export type FixtureUIEvent = ({ kind: "widget"; key: string; content: Parameters<ExtensionContext["ui"]["setWidget"]>[1] }
+  | { kind: "status"; key: string; text: string | undefined }) & { calls: number };
+export type FixtureUIFrame = { key: string; lines: string[]; calls: number };
 export type RuntimeFixtureOptions = {
   seedConversations?: boolean;
-  batchCalls?: number;
   concurrency?: number;
   contextWindow?: number;
   readyBanner?: boolean;
+  /** true observes the TUI callbacks; false initializes the real SDK headlessly. */
+  observeUI?: boolean;
   providerFetch?: FetchImpl;
   nativeReply?: (request: WireRequest, defaultReply: () => Response) => Response | Promise<Response>;
+  utilityReply?: (input: unknown, request: WireRequest, defaultReply: () => Response) => Response | Promise<Response>;
 };
 
 /** These are provider responses, not calls to host tools; the SDK owns every dispatch. */
@@ -322,8 +329,7 @@ function nativeResponse(request: WireRequest, mode: NativeRepairMode): Response 
 }
 const environmentKeys = [
   "OMP_PROFILE", "PI_PROFILE", "PI_CODING_AGENT_DIR", "OMP_HISTORY_RECALL_DB", "OMP_HISTORY_RECALL_MODEL",
-  "OMP_HISTORY_RECALL_DISABLED", "OMP_HISTORY_RECALL_BATCH_CALLS",
-  "OMP_HISTORY_RECALL_BATCH_SESSIONS", "OMP_HISTORY_RECALL_CONCURRENCY", "PI_DIALECT",
+  "OMP_HISTORY_RECALL_DISABLED", "OMP_HISTORY_RECALL_CONCURRENCY", "PI_DIALECT",
 ] as const;
 
 export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}): Promise<RuntimeFixture> {
@@ -355,8 +361,6 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     setAgentDir(agentDir);
     process.env.OMP_HISTORY_RECALL_DB = path.join(root, "index.db");
     process.env.OMP_HISTORY_RECALL_MODEL = "history-local-fixture/history-fixture";
-    process.env.OMP_HISTORY_RECALL_BATCH_CALLS = String(options.batchCalls ?? 12);
-    process.env.OMP_HISTORY_RECALL_BATCH_SESSIONS = "2";
     const concurrency = options.concurrency ?? 3;
     process.env.OMP_HISTORY_RECALL_CONCURRENCY = String(concurrency);
     const scope = await resolveRecallScope();
@@ -406,6 +410,8 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     let selectionMode: SelectionMode = "normal";
     const errors: unknown[] = [];
     const notifications: { message: string; type: string }[] = [];
+    const uiEvents: FixtureUIEvent[] = [];
+    const uiFrames: FixtureUIFrame[] = [];
     const queued: { name: string; args: Record<string, unknown> }[] = [];
     let active = 0;
     let peak = 0;
@@ -448,13 +454,16 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
             peak = Math.max(peak, active);
             try {
               await Bun.sleep(5);
-              if (invalidAnalysis && stageSchema.safeParse(input).data?.stage.startsWith("analysis_")) {
-                invalidAnalysis = false;
-                return streamReply({ role: "assistant", content: JSON.stringify({
-                  summary: "Invalid evidence fixture", facets: [{ ...storageProfile, evidence_entry_ids: ["not-in-source"] }],
-                }) });
-              }
-              return streamReply({ role: "assistant", content: JSON.stringify(utilityResponse(input, selectionMode)) });
+              const respond = () => {
+                if (invalidAnalysis && stageSchema.safeParse(input).data?.stage.startsWith("analysis_")) {
+                  invalidAnalysis = false;
+                  return streamReply({ role: "assistant", content: JSON.stringify({
+                    summary: "Invalid evidence fixture", facets: [{ ...storageProfile, evidence_entry_ids: ["not-in-source"] }],
+                  }) });
+                }
+                return streamReply({ role: "assistant", content: JSON.stringify(utilityResponse(input, selectionMode)) });
+              };
+              return await (options.utilityReply ? options.utilityReply(input, body, respond) : respond());
             } finally { active--; }
           }
           mainRequests.push(body);
@@ -515,9 +524,41 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     });
     closers.push(() => session.dispose());
     assert.deepEqual(extensionsResult.errors, []);
+    if (options.observeUI) ensureThemeSync();
+    const components = new Map<string, ExtensionUiComponent>();
+    // Native component rendering without starting a terminal or taking over stdin.
+    const tui = options.observeUI ? new TUI(new ProcessTerminal()) : undefined;
+    if (tui) tui.requestRender = () => {
+      for (const [key, component] of components) uiFrames.push({ key,
+        lines: [...component.render(160)], calls: utilityRequests.length + nativeRequests.length });
+    };
+    closers.push(() => {
+      for (const component of components.values()) component.dispose?.();
+      components.clear();
+    });
     await initializeExtensions(session, {
       reportSendError: (_action, error) => errors.push(error), reportRuntimeError: error => errors.push(error),
-      uiContext: { ...session.extensionRunner!.getUIContext(), notify: (message, type = "info") => notifications.push({ message, type }) },
+      mode: options.observeUI ? "tui" : "print",
+      uiContext: options.observeUI === false ? undefined : {
+        ...session.extensionRunner!.getUIContext(),
+        notify: (message, type = "info") => notifications.push({ message, type }),
+        setWidget(key, content) {
+          if (!options.observeUI) return;
+          uiEvents.push({ kind: "widget", key,
+            content: Array.isArray(content) ? [...content] : content, calls: utilityRequests.length + nativeRequests.length });
+          components.get(key)?.dispose?.();
+          components.delete(key);
+          if (typeof content === "function") {
+            components.set(key, content(tui!, session.extensionRunner!.getUIContext().theme));
+            tui!.requestRender();
+          } else if (content) {
+            uiFrames.push({ key, lines: [...content], calls: utilityRequests.length + nativeRequests.length });
+          }
+        },
+        setStatus(key, text) {
+          if (options.observeUI) uiEvents.push({ kind: "status", key, text, calls: utilityRequests.length + nativeRequests.length });
+        },
+      },
     });
     assert(fixtureContext, "The real SDK must deliver its session_start ExtensionContext");
     const model = ompModel(fixtureContext, metric => store.recordModelCall("index", metric));
@@ -545,7 +586,7 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
           { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens), concurrency });
         protocol.bindModel(model);
         await protocol.prepare(runOptions.signal);
-        const budget = new ModelBudget(db, scope.id, { maxCalls: runOptions.maxCalls ?? 100});
+        const budget = new ModelBudget(db, scope.id);
         const completion = await repairRunner({ protocol, budget, concurrency, signal: runOptions.signal });
         return { completion, repair: protocol.finalize(completion), calls: budget.calls };
       } finally { repairMode = priorMode; db.close(); }
@@ -572,7 +613,7 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     }
     return {
       root, scope, cwds, files, foreignFiles, store, session, model, repairRunner, runNativeBoundary,
-      requests, mainRequests, utilityRequests, nativeRequests, nativeToolCalls, errors, notifications, tool, close,
+      requests, mainRequests, utilityRequests, nativeRequests, nativeToolCalls, errors, notifications, uiEvents, uiFrames, context: fixtureContext, tool, close,
       foreignCursor, writeConversation, failNextAnalysis() { invalidAnalysis = true; },
       setRepairMode(mode) { repairMode = mode; }, setSelectionMode(mode) { selectionMode = mode; },
       get peak() { return peak; }, get nativePeak() { return nativePeak; }, concurrency,
@@ -583,7 +624,7 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
   }
 }
 
-export type NativeBoundaryOptions = { maxCalls?: number; signal?: AbortSignal; text?: string };
+export type NativeBoundaryOptions = { signal?: AbortSignal; text?: string };
 export type NativeBoundaryResult = { completion: RepairCompletion; repair: ValidatedRepair; calls: number };
 
 export type RuntimeFixture = {
@@ -604,6 +645,9 @@ export type RuntimeFixture = {
   nativeToolCalls: FixtureNativeResult[];
   errors: unknown[];
   notifications: { message: string; type: string }[];
+  uiEvents: FixtureUIEvent[];
+  uiFrames: FixtureUIFrame[];
+  context: ExtensionContext;
   tool(name: string, args?: Record<string, unknown>): Promise<FixtureToolResult>;
   close(): Promise<void>;
   foreignCursor(): Promise<string>;
@@ -780,7 +824,7 @@ async function fixtureMemberships(fixture: RuntimeFixture) {
 
 /** Full production runtime + native child + SQLite smoke; all providers and profiles are temporary. */
 export async function exerciseNativeRepair() {
-  const splitFixture = await createRuntimeFixture({ batchCalls: 100, readyBanner: true });
+  const splitFixture = await createRuntimeFixture({ readyBanner: true });
   let split: { original_topic_id: string; ui_topic_id: string; incoming_topic_id: string; repair_id: string };
   let splitCalls = 0;
   let splitAccounted = 0;
@@ -845,7 +889,7 @@ export async function exerciseNativeRepair() {
     assert.equal(splitAccounted, splitFixture.utilityRequests.length + splitCalls);
   } finally { await splitFixture.close(); }
 
-  const mergeFixture = await createRuntimeFixture({ batchCalls: 100 });
+  const mergeFixture = await createRuntimeFixture();
   try {
     await mergeFixture.session.prompt("Ordinary parent conversation before merge indexing: do not retrieve history.");
     assert.equal(mergeFixture.utilityRequests.length, 0);
