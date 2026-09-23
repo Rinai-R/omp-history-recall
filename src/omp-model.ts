@@ -39,7 +39,7 @@ export function ompModel(ctx: ExtensionContext, observe?: (metric: ModelMetric) 
           cache_read: result.usage.cacheRead, cache_write: result.usage.cacheWrite, cost: result.usage.cost.total });
         if (result.stopReason === "error" || result.stopReason === "aborted") {
           // Provider error strings can contain request data; expose only a stable code.
-          throw new RecallError("model_request_failed", "Indexing model request failed; see OMP provider diagnostics.");
+          throw new RecallError("model_request_failed", `Indexing model request failed: ${String((result as { errorMessage?: string }).errorMessage ?? "unknown").slice(0, 200)}`);
         }
         if (result.stopReason === "length") throw new RecallError("model_output_truncated", "Indexing model output hit its token limit.");
         return result.content.filter(block => block.type === "text").map(block => block.text).join("\n");

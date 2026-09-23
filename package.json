@@ -1,6 +1,6 @@
 {
   "name": "omp-history-recall",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Explicit semantic topic and conversation recall for Oh My Pi profiles",
   "repository": {
     "type": "git",
