@@ -7,6 +7,12 @@ import { HistoryStore, type IndexResult } from "./store";
 import { DEFAULT_INDEX_CONCURRENCY, validateConcurrency } from "./concurrency";
 import { resolveRecallScope } from "./scope";
 
+/** Headless runs drop ui.notify toasts; mirror every notice onto stdout. */
+function announce(ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }, message: string, type?: "info" | "warning" | "error"): void {
+  try { console.log(`[history-recall${type && type !== "info" ? `:${type}` : ""}] ${message}`); } catch { /* stdout may be detached */ }
+  ctx.ui.notify(message, type);
+}
+
 const STARTUP_CWD = process.cwd();
 type SessionState = {
   sessionId: string;
@@ -58,7 +64,7 @@ export class HistoryRuntime {
       await this.state(ctx);
     } catch (error) {
       const code = error instanceof RecallError ? error.code : "history_unavailable";
-      ctx.ui.notify(`History recall: ${code}. Normal conversation can continue.`, "warning");
+      announce(ctx, `History recall: ${code}. Normal conversation can continue.`, "warning");
     }
   }
 
@@ -97,10 +103,10 @@ export class HistoryRuntime {
     state.worker = run().then(result => {
       const code = result.errors.at(-1)?.code;
       if (code && code !== state.lastError) {
-        ctx.ui.notify(`History indexing: ${code}; progress is retained. See /history-recall status.`, "warning");
+        announce(ctx, `History indexing: ${code}; progress is retained. See /history-recall status.`, "warning");
       }
       if (result.repair_deferred.length) {
-        ctx.ui.notify(`History repair: ${result.repair_deferred.length} historical sources are not yet available for repair; the complete history has not been repaired.`, "warning");
+        announce(ctx, `History repair: ${result.repair_deferred.length} historical sources are not yet available for repair; the complete history has not been repaired.`, "warning");
       }
       state.lastError = code;
       return result;

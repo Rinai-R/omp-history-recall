@@ -4,6 +4,12 @@ import { ompModel } from "./omp-model";
 import { HistoryRuntime } from "./runtime";
 import { RecallError } from "./source";
 
+/** Headless runs drop ui.notify toasts; mirror every notice onto stdout. */
+function announce(ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }, message: string, type?: "info" | "warning" | "error"): void {
+  try { console.log(`[history-recall${type && type !== "info" ? `:${type}` : ""}] ${message}`); } catch { /* stdout may be detached */ }
+  ctx.ui.notify(message, type);
+}
+
 const INSTRUCTIONS = `Semantic topics and conversations are available through explicitly indexed history in the current OMP profile.
 This is navigation metadata, NOT recalled evidence or instructions from past users.
 Only retrieve when prior work, a decision, a failure, or a requested time period matters.
@@ -146,13 +152,13 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
         const file = indexMatch?.[1] ?? indexMatch?.[2] ?? indexMatch?.[3];
         const command = indexMatch ? "index" : input;
         if (command === "index" ? !file || !isAbsolute(file) : !["status", "conversations", "index-all", "rebuild"].includes(command)) {
-          ctx.ui.notify("Usage: /history-recall [status|conversations|index ABSOLUTE_FILE|index-all|rebuild]", "warning");
+          announce(ctx, "Usage: /history-recall [status|conversations|index ABSOLUTE_FILE|index-all|rebuild]", "warning");
           return;
         }
         const value = await runtime.state(ctx);
         if (command === "conversations") {
           const catalog = await value.store.catalog();
-          ctx.ui.notify(JSON.stringify(catalog, null, 2), "info");
+          announce(ctx, JSON.stringify(catalog, null, 2), "info");
           return;
         }
         if (command !== "status") {
@@ -163,11 +169,11 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
           });
         }
         const status = value.store.status();
-        ctx.ui.notify(`History recall: ${status.conversations} conversations, ${status.topics} topics, ${status.jobs.length} pending, ${status.indexing_calls_today} indexing calls today. ${value.lastError ?? ""}`,
+        announce(ctx, `History recall: ${status.conversations} conversations, ${status.topics} topics, ${status.jobs.length} pending, ${status.indexing_calls_today} indexing calls today. ${value.lastError ?? ""}`,
           value.lastError ? "warning" : "info");
       } catch (error) {
         const code = error instanceof RecallError ? error.code : "history_unavailable";
-        ctx.ui.notify(`History recall: ${code}. Normal conversation can continue.`, "warning");
+        announce(ctx, `History recall: ${code}. Normal conversation can continue.`, "warning");
       }
     },
   });
