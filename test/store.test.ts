@@ -135,7 +135,7 @@ async function writeLargeSession(directory: string, cwd: string) {
 
 async function index(store: HistoryStore, fixture: JsonModel, file: string, force = false, repair: RepairRunner = keepRepair) {
   await store.discover({ file, force });
-  const result = await store.work(fixture, repair, { file, maxJobs: 1, maxCalls: 1000, maxDailyCalls: 10000 });
+  const result = await store.work(fixture, repair, { file, maxJobs: 1, maxCalls: 1000 });
   expect(result).toMatchObject({ completed: 1, failed: 0, errors: [] });
   return result;
 }
@@ -538,13 +538,13 @@ describe("complete-evidence historical repair", () => {
     let admitted = 0;
     const budgeted: RepairRunner = async request => { request.budget.reserve(); admitted++; return merging(request); };
     await store.discover({ file });
-    expect(await store.work(controlled.fixture, budgeted, { file, maxCalls: 2, maxDailyCalls: 1000 })).toMatchObject({ completed: 0, failed: 1,
+    expect(await store.work(controlled.fixture, budgeted, { file, maxCalls: 2 })).toMatchObject({ completed: 0, failed: 1,
       calls: 2, errors: [{ code: "work_budget" }], topic_changes: { created: 0, updated: 0, merged: 0, reassigned: 0 } });
     expect(admitted).toBe(0);
     expect(store.status().revision).toBe(revision);
     expect(conversations(store)).toHaveLength(2);
     await store.discover({ file, force: true });
-    expect(await store.work(controlled.fixture, budgeted, { file, maxCalls: 1, maxDailyCalls: 1000 })).toMatchObject({ completed: 1, failed: 0,
+    expect(await store.work(controlled.fixture, budgeted, { file, maxCalls: 1 })).toMatchObject({ completed: 1, failed: 0,
       calls: 1, topic_changes: { merged: 1 } });
     expect(admitted).toBe(1);
     expect(store.status().indexing_calls_today).toBe(baseline + controlled.requests.length + admitted);
@@ -572,30 +572,26 @@ describe("complete-evidence historical repair", () => {
 });
 
 describe("bounded work, cache recovery and publication isolation", () => {
-  it("resumes serial analysis across batch and daily limits without repeating paid chunks", async () => {
+  it("resumes serial analysis across batch limits without repeating paid chunks", async () => {
     const { root, directory, store } = await setup();
     const file = await writeLargeSession(directory, root);
     const controlled = model(undefined, { contextWindow: 8192, maxOutputTokens: 1024 });
     await store.discover({ file });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 1, maxDailyCalls: 2 })).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "work_budget" }] });
-    await store.discover({ file, force: true });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 100, maxDailyCalls: 2 })).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "daily_budget" }] });
+    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 1 })).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "work_budget" }] });
     const paid = controlled.requests.map(request => JSON.stringify(request));
     await store.discover({ file, force: true });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 100, maxDailyCalls: 100 })).toMatchObject({ completed: 1, failed: 0, calls: controlled.requests.length - 2 });
+    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 100 })).toMatchObject({ completed: 1, failed: 0, calls: controlled.requests.length - 1 });
     for (const request of paid) expect(controlled.requests.filter(item => JSON.stringify(item) === request)).toHaveLength(1);
     expect(store.status().indexing_calls_today).toBe(controlled.requests.length);
   });
 
-  it("counts failed provider calls against reported and daily usage", async () => {
+  it("counts failed provider calls against reported usage", async () => {
     const { root, directory, store } = await setup();
     const file = await writeSession(directory, root);
     let calls = 0;
     const unavailable: JsonModel = { identity: "unavailable", generate: async () => { calls++; throw new Error("Provider unavailable"); } };
     await store.discover({ file });
-    expect(await store.work(unavailable, keepRepair, { maxDailyCalls: 1 })).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "index_error" }] });
-    await store.discover({ file, force: true });
-    expect(await store.work(unavailable, keepRepair, { maxDailyCalls: 1 })).toMatchObject({ completed: 0, failed: 1, calls: 0, errors: [{ code: "daily_budget" }] });
+    expect(await store.work(unavailable, keepRepair)).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "index_error" }] });
     expect(calls).toBe(1);
     expect(store.status().indexing_calls_today).toBe(1);
   });
@@ -607,7 +603,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
       ? { ...fallback, facets: [{ ...descriptor("storage"), evidence_entry_ids: ["not-an-entry"] }] } : fallback,
     { contextWindow: 8192, maxOutputTokens: 1024 });
     await store.discover({ file });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 100, maxDailyCalls: 100 })).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "invalid_model_output" }] });
+    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1, maxCalls: 100 })).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "invalid_model_output" }] });
     const [valid, invalid] = controlled.requests.map(request => JSON.stringify(request));
     await index(store, controlled.fixture, file, true);
     expect(controlled.requests.filter(request => JSON.stringify(request) === valid)).toHaveLength(1);
@@ -619,7 +615,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
     const file = await writeLargeSession(directory, root);
     const gated = gatedModel(3);
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { concurrency: 3, maxCalls: 100, maxDailyCalls: 100 });
+    const work = store.work(gated.fixture, keepRepair, { concurrency: 3, maxCalls: 100 });
     cleanup.push(async () => { gated.release(); await work; });
     let settled = false;
     void work.then(() => { settled = true; });
@@ -634,7 +630,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
     expect(await work).toMatchObject({ completed: 0, failed: 1, calls: 3, errors: [{ code: "invalid_model_output" }] });
     const [valid, invalidFirst, invalidLast] = gated.requests.map(request => JSON.stringify(request));
     await store.discover({ file, force: true });
-    expect(await store.work(gated.fixture, keepRepair, { concurrency: 2, maxCalls: 100, maxDailyCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
+    expect(await store.work(gated.fixture, keepRepair, { concurrency: 2, maxCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
     expect(gated.requests.filter(request => JSON.stringify(request) === valid)).toHaveLength(1);
     expect(gated.requests.filter(request => JSON.stringify(request) === invalidFirst)).toHaveLength(2);
     expect(gated.requests.filter(request => JSON.stringify(request) === invalidLast)).toHaveLength(2);
@@ -646,7 +642,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
     const file = await writeLargeSession(directory, root);
     const batch = gatedModel(2);
     await store.discover({ file });
-    const batchWork = store.work(batch.fixture, keepRepair, { concurrency: 5, maxCalls: 2, maxDailyCalls: 100 });
+    const batchWork = store.work(batch.fixture, keepRepair, { concurrency: 5, maxCalls: 2 });
     cleanup.push(async () => { batch.release(); await batchWork; });
     let batchSettled = false;
     void batchWork.then(() => { batchSettled = true; });
@@ -660,7 +656,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
 
     const daily = gatedModel(2);
     await store.discover({ file, force: true });
-    const dailyWork = store.work(daily.fixture, keepRepair, { concurrency: 5, maxCalls: 100, maxDailyCalls: 4 });
+    const dailyWork = store.work(daily.fixture, keepRepair, { concurrency: 5, maxCalls: 2 });
     cleanup.push(async () => { daily.release(); await dailyWork; });
     let dailySettled = false;
     void dailyWork.then(() => { dailySettled = true; });
@@ -670,10 +666,10 @@ describe("bounded work, cache recovery and publication isolation", () => {
     expect(store.status().indexing_calls_today).toBe(4);
     expect(dailySettled).toBeFalse();
     daily.release();
-    expect(await dailyWork).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "daily_budget" }] });
+    expect(await dailyWork).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "work_budget" }] });
     const admitted = [...batch.requests, ...daily.requests].map(request => JSON.stringify(request));
     await store.discover({ file, force: true });
-    expect(await store.work(daily.fixture, keepRepair, { concurrency: 32, maxCalls: 100, maxDailyCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
+    expect(await store.work(daily.fixture, keepRepair, { concurrency: 32, maxCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
     const all = [...batch.requests, ...daily.requests].map(request => JSON.stringify(request));
     for (const request of admitted) expect(all.filter(item => item === request)).toHaveLength(1);
     expect(store.status().indexing_calls_today).toBe(all.length);
@@ -685,7 +681,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
     const competitor = connection(store, scope, access);
     const gated = gatedModel(3);
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { file, concurrency: 3, maxCalls: 100, maxDailyCalls: 100 });
+    const work = store.work(gated.fixture, keepRepair, { file, concurrency: 3, maxCalls: 100 });
     cleanup.push(async () => { gated.release(); await work; });
     let settled = false;
     void work.then(() => { settled = true; });
@@ -709,7 +705,7 @@ describe("bounded work, cache recovery and publication isolation", () => {
     expect(lease.get(scope.id, file)).toMatchObject({ token: "", lease_until: 0, error: "index_error" });
     const [failed, second, third] = gated.requests.map(request => JSON.stringify(request));
     await store.discover({ file, force: true });
-    expect(await competitor.work(gated.fixture, keepRepair, { file, concurrency: 3, maxCalls: 100, maxDailyCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
+    expect(await competitor.work(gated.fixture, keepRepair, { file, concurrency: 3, maxCalls: 100 })).toMatchObject({ completed: 1, failed: 0 });
     expect(gated.requests.filter(request => JSON.stringify(request) === failed)).toHaveLength(2);
     expect(gated.requests.filter(request => JSON.stringify(request) === second)).toHaveLength(1);
     expect(gated.requests.filter(request => JSON.stringify(request) === third)).toHaveLength(1);
@@ -800,8 +796,8 @@ describe("authorized sources, identity and snapshots", () => {
     const controlled = model();
     await first.store.discover({ file: one });
     await other.discover({ file: two });
-    expect(await first.store.work(controlled.fixture, keepRepair, { file: one, maxDailyCalls: 1 })).toMatchObject({ completed: 1, calls: 1 });
-    expect(await other.work(controlled.fixture, keepRepair, { file: two, maxDailyCalls: 1 })).toMatchObject({ completed: 1, calls: 1 });
+    expect(await first.store.work(controlled.fixture, keepRepair, { file: one })).toMatchObject({ completed: 1, calls: 1 });
+    expect(await other.work(controlled.fixture, keepRepair, { file: two })).toMatchObject({ completed: 1, calls: 1 });
     expect(conversation(first.store, "same-id").id).not.toBe(conversation(other, "same-id").id);
     expect(topicOf(first.store, "same-id")).not.toBe(topicOf(other, "same-id"));
     expect(first.store.status()).toMatchObject({ scope_id: first.scope.id, conversations: 1, indexing_calls_today: 1 });
@@ -1042,7 +1038,7 @@ describe("bounded selection and complete repair paging", () => {
     }, { identity: "out-of-order-selection" });
     const file = await writeSession(directory, root, "incoming", ["Discussion scope: A.", "Discussion scope: B.", "Discussion scope: C."]);
     await store.discover({ file });
-    const work = store.work(controlled.fixture, keepRepair, { file, concurrency: 2, maxCalls: 100, maxDailyCalls: 1000 });
+    const work = store.work(controlled.fixture, keepRepair, { file, concurrency: 2, maxCalls: 100 });
     cleanup.push(async () => { gates.forEach((gate, slot) => gate.resolve(requests[slot] ? response(requests[slot]) : {})); await work; });
     await Promise.race([entered.promise, work.then(() => { throw new Error("Work ended before concurrent selection calls"); })]);
     expect(requests).toHaveLength(2);
@@ -1073,7 +1069,7 @@ describe("bounded selection and complete repair paging", () => {
     const file = await writeSession(directory, root, "incoming");
     await store.discover({ file });
     const revision = store.status().revision;
-    const work = store.work(controlled.fixture, repair, { file, concurrency: 2, maxCalls: 100, maxDailyCalls: 10000 });
+    const work = store.work(controlled.fixture, repair, { file, concurrency: 2, maxCalls: 100 });
     cleanup.push(async () => { release.resolve(); await work; });
     await Promise.race([entered.promise, work.then(() => { throw new Error("Work ended before the second coverage block"); })]);
     expect(checked).toHaveLength(65);
@@ -1101,7 +1097,7 @@ describe("deferred history and atomic repair source guards", () => {
     await writeSession(directory, root, "A", ["Discussion scope: storage. Corrected A."]);
     await writeSession(directory, root, "B", ["Discussion scope: storage. Corrected B."]);
     await store.discover();
-    const result = await store.work(controlled.fixture, keepRepair, { maxJobs: 2, maxCalls: 100, maxDailyCalls: 1000 });
+    const result = await store.work(controlled.fixture, keepRepair, { maxJobs: 2, maxCalls: 100 });
     expect(result).toMatchObject({ completed: 2, failed: 0, errors: [] });
     expect(result.repair_deferred).toHaveLength(1);
     expect(result.repair_deferred[0].code).toBe("stale_evidence");

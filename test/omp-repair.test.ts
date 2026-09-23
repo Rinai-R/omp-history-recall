@@ -214,18 +214,6 @@ it("rejects aborted and malformed terminal yields without giving the model anoth
   } finally { await fixture.close(); }
 }, 120_000);
 
-it("enforces the daily budget on failed native requests as well as successful requests", async () => {
-  const fixture = await createRuntimeFixture({ seedConversations: false, nativeReply: () => nativeToolReply([
-    { name: "repair_topics", args: { forbidden: true } },
-  ]) });
-  try {
-    await expect(fixture.runNativeBoundary({ maxDailyCalls: 1 })).rejects.toMatchObject({ code: "invalid_model_output" });
-    await expect(fixture.runNativeBoundary({ maxDailyCalls: 1 })).rejects.toMatchObject({ code: "daily_budget" });
-    expect(fixture.nativeRequests).toHaveLength(1);
-    expect(fixture.nativeToolCalls).toEqual([]);
-  } finally { await fixture.close(); }
-}, 120_000);
-
 it("does not launch a cancelled child or silently switch a non-native model", async () => {
   const fixture = await createRuntimeFixture({ seedConversations: false });
   try {

@@ -98,7 +98,6 @@ export type FixtureNativeResult = FixtureNativeCall & { id: string; value: Recor
 export type RuntimeFixtureOptions = {
   seedConversations?: boolean;
   batchCalls?: number;
-  dailyCalls?: number;
   concurrency?: number;
   contextWindow?: number;
   readyBanner?: boolean;
@@ -323,7 +322,7 @@ function nativeResponse(request: WireRequest, mode: NativeRepairMode): Response 
 }
 const environmentKeys = [
   "OMP_PROFILE", "PI_PROFILE", "PI_CODING_AGENT_DIR", "OMP_HISTORY_RECALL_DB", "OMP_HISTORY_RECALL_MODEL",
-  "OMP_HISTORY_RECALL_DISABLED", "OMP_HISTORY_RECALL_DAILY_CALLS", "OMP_HISTORY_RECALL_BATCH_CALLS",
+  "OMP_HISTORY_RECALL_DISABLED", "OMP_HISTORY_RECALL_BATCH_CALLS",
   "OMP_HISTORY_RECALL_BATCH_SESSIONS", "OMP_HISTORY_RECALL_CONCURRENCY", "PI_DIALECT",
 ] as const;
 
@@ -356,7 +355,6 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     setAgentDir(agentDir);
     process.env.OMP_HISTORY_RECALL_DB = path.join(root, "index.db");
     process.env.OMP_HISTORY_RECALL_MODEL = "history-local-fixture/history-fixture";
-    process.env.OMP_HISTORY_RECALL_DAILY_CALLS = String(options.dailyCalls ?? 1000);
     process.env.OMP_HISTORY_RECALL_BATCH_CALLS = String(options.batchCalls ?? 12);
     process.env.OMP_HISTORY_RECALL_BATCH_SESSIONS = "2";
     const concurrency = options.concurrency ?? 3;
@@ -547,7 +545,7 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
           { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens), concurrency });
         protocol.bindModel(model);
         await protocol.prepare(runOptions.signal);
-        const budget = new ModelBudget(db, scope.id, { maxCalls: runOptions.maxCalls ?? 100, maxDailyCalls: runOptions.maxDailyCalls ?? 1000 });
+        const budget = new ModelBudget(db, scope.id, { maxCalls: runOptions.maxCalls ?? 100});
         const completion = await repairRunner({ protocol, budget, concurrency, signal: runOptions.signal });
         return { completion, repair: protocol.finalize(completion), calls: budget.calls };
       } finally { repairMode = priorMode; db.close(); }
@@ -585,7 +583,7 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
   }
 }
 
-export type NativeBoundaryOptions = { maxCalls?: number; maxDailyCalls?: number; signal?: AbortSignal; text?: string };
+export type NativeBoundaryOptions = { maxCalls?: number; signal?: AbortSignal; text?: string };
 export type NativeBoundaryResult = { completion: RepairCompletion; repair: ValidatedRepair; calls: number };
 
 export type RuntimeFixture = {

@@ -32,7 +32,7 @@ export type CatalogResult = { scope_id: string; conversations: CatalogEntry[]; n
 export type DiscoveryResult = { scope_id: string; discovered: number; queued: number; warnings: SourceWarning[] };
 export type BrowseOptions = TimeFilter & { topic_id?: string; cursor?: string; limit?: number };
 export type IndexResult = { completed: number; failed: number; calls: number; errors: { file: string; code: string }[]; topic_changes: TopicChangeCounts; repair_deferred: DeferredRepair[] };
-export type WorkOptions = { file?: string; maxJobs?: number; maxCalls?: number; maxDailyCalls?: number; concurrency?: number; signal?: AbortSignal };
+export type WorkOptions = { file?: string; maxJobs?: number; maxCalls?: number; concurrency?: number; signal?: AbortSignal };
 
 function browseCursor(value: string, binding: string): { offset: number; range: TimeRange } {
   try {
@@ -209,13 +209,12 @@ export class HistoryStore {
     const concurrency = validateConcurrency(options.concurrency);
     const maxJobs = options.maxJobs ?? 1;
     const maxCalls = options.maxCalls ?? 12;
-    const maxDailyCalls = options.maxDailyCalls ?? 60;
-    for (const value of [maxJobs, maxCalls, maxDailyCalls]) {
+    for (const value of [maxJobs, maxCalls]) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) throw new RecallError("invalid_budget", "Work budgets must be integers between 1 and 10000.");
     }
     if (options.file !== undefined && !path.isAbsolute(options.file)) throw new RecallError("invalid_file", "Use an absolute source_file from the catalog.");
     const modelBinding = [model.identity, model.contextWindow, model.maxOutputTokens];
-    const budget = new ModelBudget(this.db, this.scope.id, { maxCalls, maxDailyCalls });
+    const budget = new ModelBudget(this.db, this.scope.id, { maxCalls });
     const budgeted = budget.wrapJson(model, input => {
       const stage = input && typeof input === "object" && "stage" in input ? input.stage : undefined;
       return typeof stage === "string" && stage.startsWith("analysis_") ? SEMANTIC_VERSION : TOPIC_VERSION;
@@ -354,11 +353,9 @@ export class HistoryStore {
 
 
   private releaseJob(job: Job, code: string): void {
-    const retryable = ["cancelled", "work_budget", "source_busy", "daily_budget", "topic_state_changed"].includes(code);
+    const retryable = ["cancelled", "work_budget", "source_busy", "topic_state_changed"].includes(code);
     const now = Date.now();
-    const retryAt = code === "daily_budget"
-      ? Date.parse(`${new Date(now).toISOString().slice(0, 10)}T00:00:00Z`) + 86_400_000
-      : now + (retryable ? 1000 : 30_000 * (job.attempts + 1));
+    const retryAt = now + (retryable ? 1000 : 30_000 * (job.attempts + 1));
     this.db.run(`UPDATE hr_jobs SET token='',lease_until=0,attempts=attempts+?,error=?,retry_at=? WHERE scope_id=? AND file=? AND token=?`,
       [retryable ? 0 : 1, code, retryAt, this.scope.id, job.file, job.token]);
   }

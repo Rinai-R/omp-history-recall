@@ -141,8 +141,7 @@ Latest: ...
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | SQLite 物理路径；共享 override 仍按 profile 隔离，相对路径按启动 cwd 解析一次 |
 | `OMP_HISTORY_RECALL_MODEL` | 当前 OMP 模型 | 索引/查询改写模型 |
 | `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | 显式批处理最大会话数 |
-| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | 每批未缓存模型调用 |
-| `OMP_HISTORY_RECALL_DAILY_CALLS` | `60` | 每 profile 每 UTC 日索引调用，所有索引阶段共享 |
+| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | 每次 `index-all` 的未缓存模型调用 |
 | `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | 分析/初选调用与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
 
 每次分析/初选请求和原生模型 turn 期限为 90 秒，不是整个会话索引的总期限；查询改写期限 30 秒。失败任务保留已校验的请求进度。取消、incoming 来源变化、并发 topic 状态变化及额度耗尽不累计失败次数。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布是原子的，不提交半份会话或主题变化；重试须由显式批次触发。

@@ -66,7 +66,7 @@ it("automatically splits a historical-only topic and immediately merges equivale
 }, 180_000);
 
 it("streams at least 130 final members through native singleton merge proofs within the normal context budget", async () => {
-  const fixture = await createRuntimeFixture({ seedConversations: false, batchCalls: 1000, dailyCalls: 5000 });
+  const fixture = await createRuntimeFixture({ seedConversations: false, batchCalls: 1000});
   const finalMembers = 130;
   try {
     let survivor = "";
@@ -79,7 +79,7 @@ it("streams at least 130 final members through native singleton merge proofs wit
       fixture.setSelectionMode(index === 1 ? "distinct" : "normal");
       await fixture.store.discover({ file });
       const seeded = await fixture.store.work(fixture.model, fixture.repairRunner,
-        { file, maxJobs: 1, maxCalls: 12, maxDailyCalls: 5000, concurrency: fixture.concurrency });
+        { file, maxJobs: 1, maxCalls: 12, concurrency: fixture.concurrency });
       expect(seeded.errors).toEqual([]);
       expect(seeded.completed).toBe(1);
       if (index === 0) survivor = z.object({ entries: z.array(z.object({ id: z.string() })) }).parse(fixture.store.browse()).entries[0].id;
@@ -238,7 +238,7 @@ it("holds the index lease until an ignored-abort native HTTP request actually se
       "WAL fsync failed; writes must not be acknowledged.");
     await fixture.store.discover({ file: fixture.files.a });
     const seeded = await fixture.store.work(fixture.model, fixture.repairRunner,
-      { file: fixture.files.a, maxCalls: 100, maxDailyCalls: 1000 });
+      { file: fixture.files.a, maxCalls: 100 });
     expect(seeded.completed).toBe(1);
     expect(seeded.errors).toEqual([]);
     const visibleBefore = fixture.store.status();
@@ -247,7 +247,7 @@ it("holds the index lease until an ignored-abort native HTTP request actually se
     await fixture.store.discover({ file: fixture.files.b });
     gateNative = true;
     const work = fixture.store.work(fixture.model, fixture.repairRunner,
-      { file: fixture.files.b, maxCalls: 100, maxDailyCalls: 1000, signal: controller.signal });
+      { file: fixture.files.b, maxCalls: 100, signal: controller.signal });
     const outcome = work.then(value => ({ status: "fulfilled" as const, value }),
       (error: unknown) => ({ status: "rejected" as const, error }));
     settledWork = outcome;
@@ -375,7 +375,7 @@ it("holds the lease while an ignored-abort native response body and its cancella
       "WAL fsync failed; writes must not be acknowledged.");
     await fixture.store.discover({ file: fixture.files.a });
     const seeded = await fixture.store.work(fixture.model, fixture.repairRunner,
-      { file: fixture.files.a, maxCalls: 100, maxDailyCalls: 1000 });
+      { file: fixture.files.a, maxCalls: 100 });
     expect(seeded.completed).toBe(1);
     expect(seeded.errors).toEqual([]);
     const visibleBefore = fixture.store.status();
@@ -384,7 +384,7 @@ it("holds the lease while an ignored-abort native response body and its cancella
     await fixture.store.discover({ file: fixture.files.b });
     gateNative = true;
     const work = fixture.store.work(fixture.model, fixture.repairRunner,
-      { file: fixture.files.b, maxCalls: 100, maxDailyCalls: 1000, signal: controller.signal });
+      { file: fixture.files.b, maxCalls: 100, signal: controller.signal });
     const outcome = work.then(value => ({ status: "fulfilled" as const, value }),
       (error: unknown) => ({ status: "rejected" as const, error }));
     settledWork = outcome;

@@ -114,7 +114,7 @@ Time filters use `days`, or inclusive `from` plus exclusive `to`. Date-only valu
 
 | Command | Purpose |
 | --- | --- |
-| `/history-recall status` | Counts, pending jobs and today's indexing calls |
+| `/history-recall status` | Counts, pending jobs and today's metered indexing calls (usage display only, no cap) |
 | `/history-recall conversations` | Indexed and unindexed source candidates |
 | `/history-recall index FILE` | Index one selected absolute source path; bare `index` returns usage |
 | `/history-recall index-all` | Discover authorized profile sources and explicitly process a bounded batch |
@@ -141,11 +141,10 @@ There is no idle background indexer. Continue unfinished work with `index-all`; 
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | Physical SQLite path; a shared override still isolates profiles, and relative overrides resolve once against startup cwd |
 | `OMP_HISTORY_RECALL_MODEL` | current OMP model | Indexing/query-rewrite model |
 | `OMP_HISTORY_RECALL_BATCH_SESSIONS` | `2` | Maximum conversations in an explicit batch |
-| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | Uncached model calls per batch |
-| `OMP_HISTORY_RECALL_DAILY_CALLS` | `60` | Indexing calls per profile per UTC day, shared by every indexing stage |
+| `OMP_HISTORY_RECALL_BATCH_CALLS` | `12` | Uncached model calls per `index-all` invocation |
 | `OMP_HISTORY_RECALL_CONCURRENCY` | `3` | Maximum concurrent analysis/selection calls and repair source reads; integer 1–32. Native repair model turns are sequential. |
 
-Each analysis/selection request and native model turn has a 90-second deadline; this is not a whole-conversation deadline. Query rewrite has a 30-second deadline. Failed jobs retain validated request progress. Cancellation, incoming-source changes, concurrent topic-state changes and exhausted budgets do not count toward the three-failure limit. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes. Retries require explicit batches.
+Each analysis/selection request and native model turn has a 90-second deadline; this is not a whole-conversation deadline. Query rewrite has a 30-second deadline. Failed jobs retain validated request progress. Cancellation, incoming-source changes, concurrent topic-state changes and an exhausted batch budget does not count toward the three-failure limit. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes. Retries require explicit batches.
 
 Cancellation retains the lease until admitted provider requests, source reads and child disposal settle. OMP 18.2.6 also performs an SDK-owned authentication preflight before its model hooks; that lookup has no cancellation-signal parameter. Cancellation is latched immediately, prevents subsequent provider dispatch, and waits for this preflight to settle without mutating the shared model registry or closing parent authentication storage.
 

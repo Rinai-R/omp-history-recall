@@ -95,7 +95,6 @@ export class HistoryRuntime {
         file,
         maxJobs: options.maxJobs ?? budget("OMP_HISTORY_RECALL_BATCH_SESSIONS", file ? 1 : 2),
         maxCalls: budget("OMP_HISTORY_RECALL_BATCH_CALLS", 12),
-        maxDailyCalls: budget("OMP_HISTORY_RECALL_DAILY_CALLS", 60),
         concurrency,
         signal,
       });

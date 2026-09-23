@@ -9,9 +9,9 @@ export class ModelBudget {
   constructor(
     private readonly db: Database,
     private readonly scopeId: string,
-    private readonly limits: { maxCalls: number; maxDailyCalls: number },
+    private readonly limits: { maxCalls: number },
   ) {
-    for (const value of [limits.maxCalls, limits.maxDailyCalls]) {
+    for (const value of [limits.maxCalls]) {
       if (!Number.isSafeInteger(value) || value < 1 || value > 10_000) {
         throw new RecallError("invalid_budget", "Work budgets must be integers between 1 and 10000.");
       }
@@ -22,12 +22,11 @@ export class ModelBudget {
 
   reserve(): void {
     if (this.#calls >= this.limits.maxCalls) throw new RecallError("work_budget", "Batch indexing model-call budget reached.");
+    // Metering only (usage visibility in /history-recall status); never a hard cap.
     const day = new Date().toISOString().slice(0, 10);
-    const reserved = this.db.query<{ calls: number }, [string, string, number]>(`
+    this.db.run(`
       INSERT INTO hr_budget(scope_id,day,calls) VALUES (?,?,1)
-      ON CONFLICT(scope_id,day) DO UPDATE SET calls=calls+1 WHERE calls<? RETURNING calls`)
-      .get(this.scopeId, day, this.limits.maxDailyCalls);
-    if (!reserved) throw new RecallError("daily_budget", "Profile indexing budget reached; work resumes after UTC midnight.");
+      ON CONFLICT(scope_id,day) DO UPDATE SET calls=calls+1`, [this.scopeId, day]);
     this.#calls++;
   }
 
