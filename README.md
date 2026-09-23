@@ -142,7 +142,7 @@ In the interactive TUI, indexing opens a live panel above the editor before disc
 | `OMP_HISTORY_RECALL_DISABLED` | unset | `1` disables the extension after restart |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | Physical SQLite path; a shared override still isolates profiles, and relative overrides resolve once against startup cwd |
 | `OMP_HISTORY_RECALL_MODEL` | current OMP model | Indexing/query-rewrite model |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `32` | Maximum concurrent analysis/selection calls and repair source reads; integer 1–32. Native repair model turns are sequential. |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `1` | Concurrent calls per conversation (analysis chunks, selection pages, repair source reads) and repair source reads; integer 1–32. Native repair model turns are sequential. |
 
 Request timeouts, source/evidence validation, context-size bounds and concurrency controls remain in place; they are not model-call quotas. Failed jobs retain validated request progress and can be attempted again by an explicit command. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes.
 

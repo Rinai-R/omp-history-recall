@@ -142,7 +142,7 @@ Latest: ...
 | `OMP_HISTORY_RECALL_DISABLED` | 不设置 | `1` 重启后禁用 |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | SQLite 物理路径；共享 override 仍按 profile 隔离，相对路径按启动 cwd 解析一次 |
 | `OMP_HISTORY_RECALL_MODEL` | 当前 OMP 模型 | 索引/查询改写模型 |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `32` | 分析/初选调用与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
+| `OMP_HISTORY_RECALL_CONCURRENCY` | `1` | 单会话内并发（分析分块、初选分页、修复原文读取）与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
 
 仍保留请求超时、来源/证据校验、上下文大小与并发控制；这些不是调用次数配额。失败任务保留已校验的请求进度，可以在下一次显式命令中再次尝试。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布保持原子性，不提交半份会话或主题变化。
 
