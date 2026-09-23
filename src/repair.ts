@@ -39,7 +39,7 @@ export type ValidatedRepair = {
   proposal: RepairProposal; proposalId: string; coverage: CoverageProof[]; sourceGuards: SourceGuard[];
   receipts: EvidenceReceipt[]; cursorUpdates: CursorUpdate[];
 };
-export type RepairRunRequest = { protocol: RepairProtocol; budget: ModelBudget; signal?: AbortSignal; concurrency: number };
+export type RepairRunRequest = { protocol: RepairProtocol; budget: ModelBudget; signal?: AbortSignal };
 export type RepairRunner = (request: RepairRunRequest) => Promise<RepairCompletion>;
 
 const CursorSchema = z.string().min(1).max(8192).optional();
@@ -92,8 +92,6 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 export class RepairProtocol {
   readonly viewId: string;
   readonly inputBytes: number;
-  readonly concurrency: number;
-  private binding?: Readonly<Pick<JsonModel, "identity" | "contextWindow" | "maxOutputTokens">>;
   private usableHistory = false;
   get modelBinding() { return this.binding; }
   get hasUsableHistory(): boolean { return this.usableHistory; }
@@ -121,19 +119,16 @@ export class RepairProtocol {
   private active?: ActiveProposal;
   private sequence = 0;
   private contextBytes = 0;
-  private io = 0;
-  private readonly waiting: (() => void)[] = [];
+  private binding?: Readonly<Pick<JsonModel, "identity" | "contextWindow" | "maxOutputTokens">>;
 
   constructor(
     readonly scope: RecallScope, private readonly registry: TopicRegistry, private readonly incoming: IncomingConversation,
     private readonly source: SessionSource, private readonly selection: TopicSelection, private readonly snapshot: TopicSnapshot,
     private readonly readSource: (conversationId: string, signal?: AbortSignal) => Promise<SessionSource>,
-    limits: { inputBytes: number; concurrency: number },
+    limits: { inputBytes: number },
   ) {
     if (!Number.isSafeInteger(limits.inputBytes) || limits.inputBytes < 1) throw new RecallError("model_context_too_small", "Repair requires a positive input budget.");
-    if (!Number.isSafeInteger(limits.concurrency) || limits.concurrency < 1 || limits.concurrency > 32) throw new RecallError("invalid_concurrency", "Repair I/O concurrency must be from 1 to 32.");
     this.inputBytes = limits.inputBytes;
-    this.concurrency = limits.concurrency;
     this.resultBytes = Math.min(Math.floor(limits.inputBytes / 4), 48 * 1024 - 1);
     this.viewId = repairViewId(scope.id, snapshot.revision, incoming, selection);
   }
@@ -153,12 +148,6 @@ export class RepairProtocol {
 
   private revision(): void { this.registry.assertRevision(this.snapshot.revision); }
 
-  private async withIo<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    if (this.io >= this.concurrency) await new Promise<void>(resolve => this.waiting.push(resolve));
-    else this.io++;
-    try { checkSignal(signal); return await run(); }
-    finally { const next = this.waiting.shift(); if (next) next(); else this.io--; }
-  }
 
   private defer(conversationId: string, error: unknown): undefined {
     if (error instanceof RecallError && ["cancelled", "topic_state_changed", "scope_mismatch", "wrong_scope", "invalid_scope", "active_session", "invalid_model_output"].includes(error.code)) throw error;
@@ -178,7 +167,7 @@ export class RepairProtocol {
     }
     if (this.unavailable.has(member.conversationId)) return undefined;
     try {
-      const source = await this.withIo(() => this.readSource(member.conversationId, signal), signal);
+      const source = await this.readSource(member.conversationId, signal);
       checkSignal(signal);
       this.revision();
       const old = this.guards.get(member.conversationId);

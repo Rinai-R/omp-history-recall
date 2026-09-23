@@ -133,48 +133,26 @@ describe("whole-catalog semantic selection", () => {
     expect(tooSmall.calls).toEqual([]);
   });
 
-  it("finishes the whole facet wave before any next-page request and preserves out-of-order results", async () => {
-    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
-    const fixture = fixtureModel(async (input, index) => {
+  it("processes selection requests strictly one at a time across catalog pages", async () => {
+    const fixture = fixtureModel((input) => {
       if (input.stage !== "select_topic") throw new Error("Unexpected stage");
-      if (index < 2) await gates[index].promise;
       const id = input.facet.title === "one" ? "t_00" : "t_01";
       return [...input.previous, ...input.candidates].some(candidate => candidate.id === id)
         ? { topic_id: id, candidate_ids: [id], reason: "Correct independent facet." } : unmatched;
     }, 5000, 512);
     const catalog = Array.from({ length: 32 }, (_, index) => ({ ...card(`t_${String(index).padStart(2, "0")}`), description: "x".repeat(450) }));
-    const run = selectTopics(fixture.model, analysis("one", "two"), catalog, { concurrency: 2 });
-    await fixture.waitForCalls(2);
-    gates[1].resolve();
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expect(fixture.calls).toHaveLength(2);
-    gates[0].resolve();
-    const result = await run;
+    const result = await selectTopics(fixture.model, analysis("one", "two"), catalog);
     expect(result.assignments.map(item => item.topicRef)).toEqual(["t_00", "t_01"]);
-    expect(fixture.peak).toBe(2);
+    expect(fixture.peak).toBe(1);
     expect(fixture.active).toBe(0);
   });
 
-  it("drains an in-flight sibling after invalid output without advancing the catalog wave", async () => {
-    const gate = Promise.withResolvers<void>();
-    const fixture = fixtureModel(async (_input, index) => {
-      if (index === 0) return { topic_id: "foreign", candidate_ids: ["foreign"], reason: "Invalid reference." };
-      await gate.promise;
-      return unmatched;
-    }, 5000, 512);
+  it("stops at the first invalid selection response without further requests", async () => {
+    const fixture = fixtureModel(() => ({ topic_id: "foreign", candidate_ids: ["foreign"], reason: "Invalid reference." }), 5000, 512);
     const catalog = Array.from({ length: 32 }, (_, index) => ({ ...card(`t_${index}`), description: "x".repeat(450) }));
-    let settled = false;
-    const outcome = selectTopics(fixture.model, analysis("one", "two", "three"), catalog, { concurrency: 2 })
-      .then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
-    await fixture.waitForCalls(2);
-    await new Promise<void>(resolve => setImmediate(resolve));
-    expect(settled).toBe(false);
-    expect(fixture.calls).toHaveLength(2);
-    expect(fixture.active).toBe(1);
-    gate.resolve();
-    expect(await outcome).toMatchObject({ code: "invalid_model_output" });
+    await expect(selectTopics(fixture.model, analysis("one", "two", "three"), catalog)).rejects.toMatchObject({ code: "invalid_model_output" });
     expect(fixture.active).toBe(0);
-    expect(fixture.calls).toHaveLength(2);
+    expect(fixture.calls).toHaveLength(1);
     expect(fixture.invalidated).toEqual([fixture.calls[0].input]);
   });
 });

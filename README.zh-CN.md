@@ -142,13 +142,10 @@ Latest: ...
 | `OMP_HISTORY_RECALL_DISABLED` | 不设置 | `1` 重启后禁用 |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | SQLite 物理路径；共享 override 仍按 profile 隔离，相对路径按启动 cwd 解析一次 |
 | `OMP_HISTORY_RECALL_MODEL` | 当前 OMP 模型 | 索引/查询改写模型 |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `1` | 单会话内并发（分析分块、初选分页、修复原文读取）与 repair 原文读取的最大并发，整数 1–32；child 模型 turns 始终顺序执行 |
 
-仍保留请求超时、来源/证据校验、上下文大小与并发控制；这些不是调用次数配额。失败任务保留已校验的请求进度，可以在下一次显式命令中再次尝试。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布保持原子性，不提交半份会话或主题变化。
+仍保留请求超时、来源/证据校验与上下文大小控制；这些不是调用次数配额。失败任务保留已校验的请求进度，可以在下一次显式命令中再次尝试。已经使用的历史证据变化返回 `stale_evidence`，非法终态不能伪装为成功 no-op。发布保持原子性，不提交半份会话或主题变化。
 
 取消后仍持有 lease，直到已开始的 provider 请求、原文读取和 child 销毁全部结束。OMP 18.2.6 在模型 hook 前还有一次 SDK 自有认证预检，该 lookup 没有取消信号参数；插件立即锁存取消、阻止后续 provider 请求，并等该预检结束，不修改共享 model registry 或关闭父会话认证存储。
-
-例如 `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` 允许最多六个并发分析/初选调用或原文读取，不会同时运行六个 child 模型 turns。
 
 ## 验证
 

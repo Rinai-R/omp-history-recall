@@ -147,6 +147,15 @@ describe("bounded concurrency", () => {
   });
 });
 
+function respondCall(controlled: ReturnType<typeof gatedModel>, index: number): void {
+  const input = controlled.calls[index].input as CallInput;
+  const ids = input.entries ? input.entries.map(entry => entry.id).join(",")
+    : input.segments!.map(segment => segment.summary.split("|")[0]).join(",");
+  controlled.calls[index].response.resolve(JSON.stringify({
+    summary: `${ids}|${input.entries ? "x".repeat(1800) : ""}`, facets: [responseFacet(input)],
+  }));
+}
+
 describe("conversation semantics", () => {
   it("computes activity windows, message counts, user turns and branches", async () => {
     const fixture = await source();
@@ -286,53 +295,40 @@ describe("conversation semantics", () => {
   it("rejects invalid concurrency before the empty-conversation shortcut", async () => {
     const fixture = await source();
     try {
-      const loaded = { ...fixture.loaded, entries: [] };
       const controlled = gatedModel();
       for (const concurrency of [0, -1, 1.5, 33, NaN, Infinity]) {
-        await expect(analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency }))
+        await expect(mapConcurrent([1], concurrency, async value => value))
           .rejects.toMatchObject({ code: "invalid_concurrency" });
       }
       expect(controlled.calls).toEqual([]);
     } finally { await fixture.cleanup(); }
   });
 
-  it("keeps both concurrent layers ordered when their earliest request finishes last", async () => {
+  it("processes layered analysis strictly in order and preserves every entry in the final request", async () => {
     const fixture = await source();
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency: 3 });
-      const released = new Set<number>();
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
       const lastId = loaded.entries.at(-1)!.id;
-      const respond = (index: number) => {
-        const input = controlled.calls[index].input as CallInput;
-        const ids = input.entries ? input.entries.map(entry => entry.id).join(",")
-          : input.segments!.map(segment => segment.summary.split("|")[0]).join(",");
-        controlled.calls[index].response.resolve(JSON.stringify({
-          summary: `${ids}|${input.entries ? "x".repeat(1800) : ""}`, facets: [responseFacet(input)],
-        }));
-        released.add(index);
-      };
-      expect(controlled.calls).toHaveLength(3);
+      // Serial map layer: exactly one request is in flight; answer each as it arrives.
       while (!(controlled.calls.at(-1)!.input as CallInput).entries!.some(entry => entry.id === lastId)) {
-        const count = controlled.calls.length;
-        respond(count - 1);
-        await controlled.waitForCalls(count + 1);
+        await controlled.waitForCalls(1);
+        respondCall(controlled, controlled.calls.length - 1);
       }
       const mapCount = controlled.calls.length;
       expect(controlled.calls.every(call => (call.input as CallInput).entries)).toBe(true);
-      for (let index = mapCount - 1; index >= 0; index--) if (!released.has(index)) respond(index);
-      await controlled.waitForCalls(mapCount + 3);
-      expect(controlled.calls.slice(mapCount).every(call => (call.input as CallInput).stage === "analysis_reduce")).toBe(true);
-      while (!(controlled.calls.at(-1)!.input as CallInput).segments!.some(segment => segment.summary.split("|")[0].split(",").includes(lastId))) {
-        const count = controlled.calls.length;
-        respond(count - 1);
-        await controlled.waitForCalls(count + 1);
+      expect(controlled.maximumActive).toBe(1);
+      // Serial reduce layer: same one-at-a-time contract until the final chunk containing the last entry.
+      while ((controlled.calls.at(-1)!.input as CallInput).segments === undefined
+        || !(controlled.calls.at(-1)!.input as CallInput).segments!.some(segment => segment.summary.split("|")[0].split(",").includes(lastId))) {
+        await controlled.waitForCalls(controlled.calls.length + 1);
+        respondCall(controlled, controlled.calls.length - 1);
       }
-      const reduceEnd = controlled.calls.length;
-      expect(controlled.calls.every(call => (call.input as CallInput).stage !== "analysis_final")).toBe(true);
-      for (let index = reduceEnd - 1; index >= mapCount; index--) if (!released.has(index)) respond(index);
-      await controlled.waitForCalls(reduceEnd + 1);
+      // Responding the last reduce lets the serial loop issue the final call.
+      await controlled.waitForCalls(controlled.calls.length + 1);
+      const reduceEnd = controlled.calls.length - 1;
+      expect(controlled.calls.slice(mapCount, reduceEnd).every(call => (call.input as CallInput).stage === "analysis_reduce")).toBe(true);
       const final = controlled.calls[reduceEnd];
       const finalInput = final.input as CallInput;
       expect(finalInput.entry_count).toBe(loaded.entries.length);
@@ -340,44 +336,38 @@ describe("conversation semantics", () => {
         .toEqual(loaded.entries.map(entry => entry.id));
       final.response.resolve(JSON.stringify({ summary: "Ordered history", facets: [responseFacet(finalInput)] }));
       expect((await run).summary).toBe("Ordered history");
-      expect(controlled.maximumActive).toBe(3);
       expect(controlled.active).toBe(0);
       expect(controlled.calls).toHaveLength(reduceEnd + 1);
     } finally { await fixture.cleanup(); }
   });
 
-  it("evicts each invalid concurrent response without evicting a valid sibling or publishing final analysis", async () => {
+  it("evicts an invalid response and never publishes a final analysis built from it", async () => {
     const fixture = await source();
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
-      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { concurrency: 3 });
-      const outcome = run.then(() => ({ error: undefined, active: controlled.active, invalidated: [...controlled.invalidated] }),
-        (error: unknown) => ({ error, active: controlled.active, invalidated: [...controlled.invalidated] }));
-      const [first, valid, invalid] = controlled.calls;
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded));
+      const outcome = run.then(() => ({ error: undefined, invalidated: [...controlled.invalidated] }),
+        (error: unknown) => ({ error, invalidated: [...controlled.invalidated] }));
+      // Serial map layer: the first response arrives and is invalid.
+      await controlled.waitForCalls(1);
+      const first = controlled.calls[0];
       first.response.resolve("not JSON");
-      await controlled.waitForInvalidations(1);
-      valid.response.resolve(JSON.stringify({ summary: "Valid cached summary", facets: [responseFacet(valid.input as CallInput)] }));
-      await valid.response.promise;
-      invalid.response.resolve(JSON.stringify({ summary: "References an entry from a different leaf", facets: [
-        { ...responseFacet(invalid.input as CallInput), evidence_entry_ids: [(first.input as CallInput).entries![0].id] },
-      ] }));
-      expect(await outcome).toMatchObject({ error: { code: "invalid_model_output" }, active: 0, invalidated: [
-        { system: first.system, input: first.input }, { system: invalid.system, input: invalid.input },
+      expect(await outcome).toMatchObject({ error: { code: "invalid_model_output" }, invalidated: [
+        { system: first.system, input: first.input },
       ] });
-      expect(controlled.invalidated.map(request => request.input)).toEqual([first.input, invalid.input]);
-      expect(controlled.calls).toHaveLength(3);
+      expect(controlled.calls).toHaveLength(1);
     } finally { await fixture.cleanup(); }
   });
 
-  it("drains ignored map cancellation without starting queued chunks or the final layer", async () => {
+  it("does not start later chunks after cancellation while the in-flight chunk finishes", async () => {
     const fixture = await source();
     try {
       const loaded = { ...fixture.loaded, entries: entries(18, "x".repeat(2400)) };
       const controlled = gatedModel();
       const controller = new AbortController();
       const reason = new Error("index cancelled");
-      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { signal: controller.signal, concurrency: 2 });
+      const run = analyzeConversation(controlled.model, loaded, conversationFacts(loaded), { signal: controller.signal });
       let settled = false;
       const outcome = run.then(() => {
         settled = true;
@@ -386,17 +376,16 @@ describe("conversation semantics", () => {
         settled = true;
         return { error, active: controlled.active };
       });
-      expect(controlled.calls).toHaveLength(2);
+      await controlled.waitForCalls(1);
+      const started = controlled.calls[0];
       controller.abort(reason);
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(settled).toBe(false);
-      for (const call of controlled.calls) {
-        expect(call.signal).toBe(controller.signal);
-        call.response.resolve(JSON.stringify({ summary: "Finished despite cancellation", facets: [responseFacet(call.input as CallInput)] }));
-        await call.response.promise;
-      }
+      expect(started.signal).toBe(controller.signal);
+      started.response.resolve(JSON.stringify({ summary: "Finished despite cancellation", facets: [responseFacet(started.input as CallInput)] }));
+      await started.response.promise;
       expect(await outcome).toEqual({ error: reason, active: 0 });
-      expect(controlled.calls).toHaveLength(2);
+      expect(controlled.calls).toHaveLength(1);
       expect(controlled.invalidated).toEqual([]);
     } finally { await fixture.cleanup(); }
   });

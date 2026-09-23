@@ -142,13 +142,10 @@ In the interactive TUI, indexing opens a live panel above the editor before disc
 | `OMP_HISTORY_RECALL_DISABLED` | unset | `1` disables the extension after restart |
 | `OMP_HISTORY_RECALL_DB` | `<profile sessions root>/history-recall/index.db` | Physical SQLite path; a shared override still isolates profiles, and relative overrides resolve once against startup cwd |
 | `OMP_HISTORY_RECALL_MODEL` | current OMP model | Indexing/query-rewrite model |
-| `OMP_HISTORY_RECALL_CONCURRENCY` | `1` | Concurrent calls per conversation (analysis chunks, selection pages, repair source reads) and repair source reads; integer 1–32. Native repair model turns are sequential. |
 
-Request timeouts, source/evidence validation, context-size bounds and concurrency controls remain in place; they are not model-call quotas. Failed jobs retain validated request progress and can be attempted again by an explicit command. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes.
+Request timeouts, source/evidence validation and context-size bounds remain in place; they are not model-call quotas. Failed jobs retain validated request progress and can be attempted again by an explicit command. Used historical evidence changing produces `stale_evidence`; malformed repair output cannot become a successful no-op. Publication is atomic: failures cannot publish partial topic or conversation changes.
 
 Cancellation retains the lease until admitted provider requests, source reads and child disposal settle. OMP 18.2.6 also performs an SDK-owned authentication preflight before its model hooks; that lookup has no cancellation-signal parameter. Cancellation is latched immediately, prevents subsequent provider dispatch, and waits for this preflight to settle without mutating the shared model registry or closing parent authentication storage.
-
-For example, `OMP_HISTORY_RECALL_CONCURRENCY=6 omp` lowers concurrent analysis/selection calls or source reads to six; the default is 32. Native repair model turns stay sequential.
 
 ## Verification
 

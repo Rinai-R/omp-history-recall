@@ -1,8 +1,6 @@
 import { RecallError } from "./source";
 
-export const DEFAULT_INDEX_CONCURRENCY = 1;
-
-export function validateConcurrency(value: number = DEFAULT_INDEX_CONCURRENCY): number {
+export function validateConcurrency(value: number): number {
   if (!Number.isInteger(value) || value < 1 || value > 32) {
     throw new RecallError("invalid_concurrency", "Index concurrency must be an integer between 1 and 32.");
   }

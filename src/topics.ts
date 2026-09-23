@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { inputBudget, requestBytes } from "./chunking";
-import { mapConcurrent, validateConcurrency } from "./concurrency";
 import {
   generateJson,
   type ConversationAnalysis,
@@ -40,7 +39,7 @@ export type TopicSelection = {
   newTopics: { ref: string; descriptor: TopicDescriptor }[];
   neighborIds: string[];
 };
-export type TopicOptions = { signal?: AbortSignal; concurrency?: number };
+export type TopicOptions = { signal?: AbortSignal };
 export type TopicSnapshot = { revision: number; cards: TopicCard[] };
 export type CursorUpdate = { topicId: string; afterFacetKey: string };
 export type ClusterPlan = {
@@ -125,7 +124,6 @@ export async function selectTopics(
   catalog: readonly TopicCard[],
   options: TopicOptions = {},
 ): Promise<TopicSelection> {
-  const concurrency = validateConcurrency(options.concurrency);
   options.signal?.throwIfAborted();
   const result: TopicSelection = { assignments: [], newTopics: [], neighborIds: [] };
   if (!analysis.facets.length) return result;
@@ -164,8 +162,10 @@ export async function selectTopics(
         });
       return { state, end, input, schema };
     });
-    const outputs = await mapConcurrent(wave, concurrency,
-      request => generateJson(model, SELECT_SYSTEM, request.input, request.schema, options.signal), options.signal);
+    const outputs: { topic_id: string | null; candidate_ids: string[]; reason: string }[] = [];
+    for (const request of wave) {
+      outputs.push(await generateJson(model, SELECT_SYSTEM, request.input, request.schema, options.signal));
+    }
     for (let index = 0; index < wave.length; index++) {
       const { state, end } = wave[index];
       state.offset = end;

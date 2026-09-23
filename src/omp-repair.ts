@@ -248,7 +248,7 @@ export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelM
   const contextWindow = model.contextWindow ?? undefined;
   const maxOutputTokens = Math.min(8192, model.maxTokens ?? 8192);
   const inputBytes = inputBudget(contextWindow, maxOutputTokens);
-  return async ({ protocol, budget, signal, concurrency }) => {
+  return async ({ protocol, budget, signal }) => {
     if (signal?.aborted) throw new RecallError("cancelled", "History repair was cancelled.");
     if (!await sdkSettlementCapability()) {
       throw new RecallError("unsupported_omp", "Native topic repair requires the pinned SDK inner-stream settlement patch.");
@@ -258,7 +258,7 @@ export function ompRepairRunner(ctx: ExtensionContext, observe?: (metric: ModelM
     }
     const binding = protocol.modelBinding;
     if (!binding || binding.identity !== identity || binding.contextWindow !== contextWindow || binding.maxOutputTokens !== maxOutputTokens ||
-        protocol.inputBytes !== inputBytes || protocol.concurrency !== concurrency) {
+        protocol.inputBytes !== inputBytes) {
       throw new RecallError("unsupported_repair_model", "Analysis and repair must use the same captured model and limits.");
     }
     let session: AgentSession | undefined;

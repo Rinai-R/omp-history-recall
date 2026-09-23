@@ -29,7 +29,7 @@ type Fixture = {
   db: Database; scope: RecallScope; sources: Map<string, SessionSource | Error>; incoming: IncomingConversation; incomingSource: SessionSource;
   registry: TopicRegistry; selection: TopicSelection; snapshot: TopicSnapshot; protocol: RepairProtocol; tools: Map<string, ToolDefinition>;
   call<T = Record<string, unknown>>(name: string, args: unknown, id?: string): Promise<T>;
-  readonly peak: number; readonly reads: number; setReadHook(hook: (id: string) => Promise<void>): void;
+  readonly reads: number; setReadHook(hook: (id: string) => Promise<void>): void;
 };
 
 function source(id: string, text: string): SessionSource {
@@ -43,7 +43,7 @@ function assistant(calls: { id: string; name: string; arguments: Record<string, 
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 0 };
 }
 
-async function fixture(specs: SourceSpec[] = [{ id: "a" }], options: { inputBytes?: number; concurrency?: number; selectedTopic?: string; beforePrepare?: (sources: Map<string, SessionSource | Error>) => void } = {}): Promise<Fixture> {
+async function fixture(specs: SourceSpec[] = [{ id: "a" }], options: { inputBytes?: number; selectedTopic?: string; beforePrepare?: (sources: Map<string, SessionSource | Error>) => void } = {}): Promise<Fixture> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "recall-repair-protocol-"));
   const db = openHistoryDatabase(path.join(directory, "history.sqlite"));
   cleanup.push(async () => { db.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -85,20 +85,16 @@ async function fixture(specs: SourceSpec[] = [{ id: "a" }], options: { inputByte
     : { assignments: [{ facetId: "f0", topicRef: "new:f0", candidateIds: [], reason: "First topic." }], newTopics: [{ ref: "new:f0", descriptor: profile }], neighborIds: [] };
   const registry = new TopicRegistry(db, scope.id, "active-session");
   const snapshot = registry.snapshot();
-  let active = 0;
-  let peak = 0;
   let reads = 0;
   let readHook: ((id: string) => Promise<void>) | undefined;
   const protocol = new RepairProtocol(scope, registry, incoming, incomingSource, selection, snapshot, async id => {
-    reads++; active++; peak = Math.max(peak, active);
-    try {
-      await readHook?.(id);
-      const value = sources.get(id);
-      if (value instanceof Error) throw value;
-      if (!value) throw new RecallError("source_missing", "History source is unavailable.");
-      return value;
-    } finally { active--; }
-  }, { inputBytes: options.inputBytes ?? 64 * 1024, concurrency: options.concurrency ?? 3 });
+    reads++;
+    await readHook?.(id);
+    const value = sources.get(id);
+    if (value instanceof Error) throw value;
+    if (!value) throw new RecallError("source_missing", "History source is unavailable.");
+    return value;
+  }, { inputBytes: options.inputBytes ?? 64 * 1024 });
   const tools = new Map(protocol.tools().map(tool => [tool.name, tool]));
   let serial = 0;
   async function call<T = Record<string, unknown>>(name: string, args: unknown, id = `call-${++serial}`): Promise<T> {
@@ -108,7 +104,7 @@ async function fixture(specs: SourceSpec[] = [{ id: "a" }], options: { inputByte
   }
   options.beforePrepare?.(sources);
   return { db, scope, sources, incoming, incomingSource, registry, selection, snapshot, protocol, tools, call,
-    get peak() { return peak; }, get reads() { return reads; }, setReadHook(hook: (id: string) => Promise<void>) { readHook = hook; } };
+    get reads() { return reads; }, setReadHook(hook: (id: string) => Promise<void>) { readHook = hook; } };
 }
 
 
@@ -374,7 +370,7 @@ describe("revision-bound repair protocol", () => {
     expect(result.sourceGuards.length).toBe(130);
   });
 
-  it("strictly rejects forged scope, undeclared tools, excessive batches and unsafe terminal concurrency", async () => {
+  it("strictly rejects forged scope, undeclared tools, excessive batches and unsafe terminal yields", async () => {
     const f = await fixture(); await f.protocol.prepare();
     await expect(f.call("repair_read", { action: "read", conversation_id: "other-profile", facet_id: "f0", entry_id: "entry-a" })).rejects.toMatchObject({ code: "invalid_model_output" });
     await expect(f.call("repair_read", { action: "read", conversation_id: "a", facet_id: "f0", entry_id: "entry-a", path: "/etc/passwd" })).rejects.toMatchObject({ code: "invalid_model_output" });
@@ -387,8 +383,8 @@ describe("revision-bound repair protocol", () => {
     await expect(f.call("repair_topics", {})).rejects.toMatchObject({ code: "topic_state_changed" });
   });
 
-  it("reserves concurrent read results together and does no I/O or receipt work for retry pages", async () => {
-    const f = await fixture([{ id: "a", text: "durability failure ".repeat(1000) }, { id: "b", text: "durability failure ".repeat(1000) }], { inputBytes: 12000, concurrency: 2 });
+  it("reserves batched read results together and does no I/O or receipt work for retry pages", async () => {
+    const f = await fixture([{ id: "a", text: "durability failure ".repeat(1000) }, { id: "b", text: "durability failure ".repeat(1000) }], { inputBytes: 12000 });
     await f.protocol.prepare();
     const messages: Message[] = [{ role: "developer", content: JSON.stringify(f.protocol.input()), timestamp: 0 }, { role: "developer", content: "Required outstanding evidence ".repeat(190), timestamp: 0 }];
     f.protocol.providerContext({ messages });
@@ -398,13 +394,12 @@ describe("revision-bound repair protocol", () => {
     const results = await Promise.all(calls.map(call => f.call<Record<string, unknown>>(call.name, call.arguments, call.id)));
     expect(results.some(result => result.retry_after_remember === true)).toBe(true);
     expect(f.reads - before).toBe(results.filter(result => result.retry_after_remember !== true).length);
-    expect(f.peak).toBeLessThanOrEqual(2);
     expect(() => f.protocol.finalize(keep)).toThrow(expect.objectContaining({ code: "invalid_model_output" }));
   });
 
   it("reconstructs the same proof progress despite inverted source I/O completion order", async () => {
-    const f = await fixture([{ id: "a" }, { id: "b" }], { concurrency: 2 });
-    const replay = await fixture([{ id: "a" }, { id: "b" }], { concurrency: 2 });
+    const f = await fixture([{ id: "a" }, { id: "b" }]);
+    const replay = await fixture([{ id: "a" }, { id: "b" }]);
     await f.protocol.prepare(); await replay.protocol.prepare();
     const calls = ["a", "b"].map(conversation => ({ id: `ordered-${conversation}`, name: "repair_read", arguments: { action: "read", conversation_id: conversation, facet_id: "f0", entry_id: `entry-${conversation}` } }));
     const blocked = Promise.withResolvers<void>();
@@ -425,7 +420,7 @@ describe("revision-bound repair protocol", () => {
   });
 
   it("drains all started preparation I/O after cancellation and never defers scope failures", async () => {
-    const f = await fixture([{ id: "a" }, { id: "b" }], { concurrency: 2 });
+    const f = await fixture([{ id: "a" }, { id: "b" }]);
     const first = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     f.setReadHook(async id => { if (id === "a") { first.resolve(); throw new RecallError("cancelled", "stop"); } await release.promise; });

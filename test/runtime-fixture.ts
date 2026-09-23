@@ -102,7 +102,6 @@ export type FixtureUIEvent = ({ kind: "widget"; key: string; content: Parameters
 export type FixtureUIFrame = { key: string; lines: string[]; calls: number };
 export type RuntimeFixtureOptions = {
   seedConversations?: boolean;
-  concurrency?: number;
   contextWindow?: number;
   readyBanner?: boolean;
   /** true observes the TUI callbacks; false initializes the real SDK headlessly. */
@@ -329,7 +328,7 @@ function nativeResponse(request: WireRequest, mode: NativeRepairMode): Response 
 }
 const environmentKeys = [
   "OMP_PROFILE", "PI_PROFILE", "PI_CODING_AGENT_DIR", "OMP_HISTORY_RECALL_DB", "OMP_HISTORY_RECALL_MODEL",
-  "OMP_HISTORY_RECALL_DISABLED", "OMP_HISTORY_RECALL_CONCURRENCY", "PI_DIALECT",
+  "OMP_HISTORY_RECALL_DISABLED", "PI_DIALECT",
 ] as const;
 
 export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}): Promise<RuntimeFixture> {
@@ -361,8 +360,6 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
     setAgentDir(agentDir);
     process.env.OMP_HISTORY_RECALL_DB = path.join(root, "index.db");
     process.env.OMP_HISTORY_RECALL_MODEL = "history-local-fixture/history-fixture";
-    const concurrency = options.concurrency ?? 3;
-    process.env.OMP_HISTORY_RECALL_CONCURRENCY = String(concurrency);
     const scope = await resolveRecallScope();
     const cwds = { a: path.join(root, "storage-a"), b: path.join(root, "storage-b"), c: path.join(root, "interface-c") };
     await Promise.all(Object.values(cwds).map(cwd => fs.mkdir(cwd)));
@@ -583,11 +580,11 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
         const topics = new TopicRegistry(db, scope.id, manager.getSessionId());
         const protocol = new RepairProtocol(scope, topics, incoming, source, selection, topics.snapshot(),
           async () => { throw new Error("Boundary fixture has no historical sources"); },
-          { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens), concurrency });
+          { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens) });
         protocol.bindModel(model);
         await protocol.prepare(runOptions.signal);
         const budget = new ModelBudget(db, scope.id);
-        const completion = await repairRunner({ protocol, budget, concurrency, signal: runOptions.signal });
+        const completion = await repairRunner({ protocol, budget, signal: runOptions.signal });
         return { completion, repair: protocol.finalize(completion), calls: budget.calls };
       } finally { repairMode = priorMode; db.close(); }
     }
@@ -616,10 +613,9 @@ export async function createRuntimeFixture(options: RuntimeFixtureOptions = {}):
       requests, mainRequests, utilityRequests, nativeRequests, nativeToolCalls, errors, notifications, uiEvents, uiFrames, context: fixtureContext, tool, close,
       foreignCursor, writeConversation, failNextAnalysis() { invalidAnalysis = true; },
       setRepairMode(mode) { repairMode = mode; }, setSelectionMode(mode) { selectionMode = mode; },
-      get peak() { return peak; }, get nativePeak() { return nativePeak; }, concurrency,
+      get peak() { return peak; }, get nativePeak() { return nativePeak; },
     };
   } catch (error) {
-    await close();
     throw error;
   }
 }
@@ -657,7 +653,6 @@ export type RuntimeFixture = {
   setSelectionMode(mode: SelectionMode): void;
   readonly peak: number;
   readonly nativePeak: number;
-  concurrency: number;
 };
 const catalogSchema = z.object({ scope_id: z.string(), next_cursor: z.string().nullable(), conversations: z.array(z.object({
   source_file: z.string(), indexed: z.boolean(), source_cwd: z.string().nullable(), time_basis: z.enum(["filesystem", "indexed"]),
@@ -755,10 +750,10 @@ export async function exerciseSemanticRecall(fixture: RuntimeFixture) {
   assert(fixture.mainRequests.every(request => JSON.stringify(request.messages[0]) === firstSystem), "Indexing must not mutate the static system prompt");
   assert(!JSON.stringify(fixture.utilityRequests).includes("FOREIGN_PROFILE_SECRET"));
   assert.deepEqual(fixture.errors, []);
-  assert(fixture.peak > 0 && fixture.peak <= fixture.concurrency);
+  assert(fixture.peak > 0);
   return {
     topics: topics.length, a_topic_id: a.memberships[0].topic_id, b_topic_id: b.memberships[0].topic_id,
-    c_topic_id: c.memberships[0].topic_id, source_a_read: true, peak_calls: fixture.peak, concurrency: fixture.concurrency,
+    c_topic_id: c.memberships[0].topic_id, source_a_read: true, peak_calls: fixture.peak,
     fixture_calls: fixture.utilityRequests.length + fixture.nativeRequests.length,
     native_calls: fixture.nativeRequests.length, native_tool_sequence: fixture.nativeToolCalls.map(call => call.name), semantic_quality_evaluated: false,
   };
@@ -785,13 +780,13 @@ export async function exerciseNativeRepairBoundary(options: RuntimeFixtureOption
     const catalog = await fixture.tool("history_recall_conversations");
     assert.equal(catalog.isError, false);
     assert.equal(fixture.nativeRequests.length, nativeBeforeParent, "The parent remains ordinary after child disposal");
-    assert(fixture.nativePeak > 0 && fixture.nativePeak <= fixture.concurrency);
+    assert(fixture.nativePeak > 0);
     assert.equal(result.calls, fixture.nativeRequests.length);
     assert.deepEqual(fixture.errors, []);
     return { native_boundary: true, parent_after_dispose: true, source_read: true,
       repair_tools_exposed_to_parent: false, child_tools_restricted: true, ordinary_parent_child_calls: 0,
       native_tool_sequence: fixture.nativeToolCalls.map(call => call.name), native_calls: fixture.nativeRequests.length,
-      accounted_calls: result.calls, peak_calls: fixture.peak, concurrency: fixture.concurrency, semantic_quality_evaluated: false };
+      accounted_calls: result.calls, peak_calls: fixture.peak, semantic_quality_evaluated: false };
   } finally { await fixture.close(); }
 }
 
@@ -921,13 +916,13 @@ export async function exerciseNativeRepair() {
       assert.deepEqual(mergeFixture.errors, []);
       assert.equal(accounted, mergeFixture.utilityRequests.length + mergeFixture.nativeRequests.length);
       peak = Math.max(peak, mergeFixture.peak);
-      assert(peak > 0 && peak <= mergeFixture.concurrency);
+      assert(peak > 0);
       return { historical_only_split: true, immediate_merge: true, source_original_readable: true,
         source_entries_fts_unchanged: true, parent_after_dispose: true, split: split!, merge_survivor: first,
         repair_tools_exposed_to_parent: false, child_tools_restricted: true, ordinary_parent_child_calls: 0,
         native_tool_sequence: [...splitSequence, ...mergeFixture.nativeToolCalls.map(call => call.name)],
         native_calls: splitCalls + mergeFixture.nativeRequests.length, accounted_calls: splitAccounted + accounted,
-        peak_calls: peak, concurrency: mergeFixture.concurrency, semantic_quality_evaluated: false };
+        peak_calls: peak, semantic_quality_evaluated: false };
     } finally { db.close(); }
   } finally { await mergeFixture.close(); }
 }

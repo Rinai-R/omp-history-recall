@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { RecallError, redactStructured, type SessionSource } from "./source";
 import { inputBudget, planChunks, requestBytes } from "./chunking";
-import { mapConcurrent, validateConcurrency } from "./concurrency";
 
 export type JsonModel = {
   readonly identity: string;
@@ -180,9 +179,8 @@ export async function analyzeConversation(
   model: JsonModel,
   source: SessionSource,
   facts: ConversationFacts,
-  options: { signal?: AbortSignal; concurrency?: number } = {},
+  options: { signal?: AbortSignal } = {},
 ): Promise<ConversationAnalysis> {
-  const concurrency = validateConcurrency(options.concurrency);
   options.signal?.throwIfAborted();
   if (!source.entries.some(entry => entry.text.length > 0)) {
     return { summary: "No textual conversation content is available.", facets: [] };
@@ -208,8 +206,11 @@ export async function analyzeConversation(
   if (chunks.length === 1) {
     return finalize({ ...finalMetadata, entries: chunks[0] }, new Set(chunks[0].map(entry => entry.id)));
   }
-  let segments = await mapConcurrent(chunks, concurrency, entries => generateJson(model, ANALYSIS_MAP_SYSTEM,
-    { ...mapMetadata, entries }, analysisResponseSchema(new Set(entries.map(entry => entry.id))), options.signal), options.signal);
+  let segments: AnalysisSegment[] = [];
+  for (const entries of chunks) {
+    segments.push(await generateJson(model, ANALYSIS_MAP_SYSTEM,
+      { ...mapMetadata, entries }, analysisResponseSchema(new Set(entries.map(entry => entry.id))), options.signal));
+  }
   const reduceOverhead = requestBytes(ANALYSIS_REDUCE_SYSTEM, { ...reduceMetadata, segments: [] });
   while (true) {
     const sizes = segments.map(segment => Buffer.byteLength(JSON.stringify(segment), "utf8"));
@@ -233,8 +234,11 @@ export async function analyzeConversation(
       group.push(segments[index]);
     }
     if (group.length) groups.push(group);
-    const reduced = await mapConcurrent(groups, concurrency, batch => generateJson(model, ANALYSIS_REDUCE_SYSTEM,
-      { ...reduceMetadata, segments: batch }, analysisResponseSchema(segmentEvidence(batch)), options.signal), options.signal);
+    const reduced: AnalysisSegment[] = [];
+    for (const batch of groups) {
+      reduced.push(await generateJson(model, ANALYSIS_REDUCE_SYSTEM,
+        { ...reduceMetadata, segments: batch }, analysisResponseSchema(segmentEvidence(batch)), options.signal));
+    }
     const reducedBytes = reduced.reduce((sum, segment) => sum + Buffer.byteLength(JSON.stringify(segment), "utf8"), reduced.length - 1);
     if (reduced.length >= segments.length && reducedBytes >= totalBytes) {
       throw new RecallError("model_reduce_not_shrinking", "The model did not shorten segment summaries enough to make progress toward a bounded final request.");

@@ -79,7 +79,7 @@ it("streams at least 130 final members through native singleton merge proofs wit
       fixture.setSelectionMode(index === 1 ? "distinct" : "normal");
       await fixture.store.discover({ file });
       const seeded = await fixture.store.work(fixture.model, fixture.repairRunner,
-        { file, concurrency: fixture.concurrency });
+        { file });
       expect(seeded.errors).toEqual([]);
       expect(seeded.completed).toBe(1);
       if (index === 0) survivor = z.object({ entries: z.array(z.object({ id: z.string() })) }).parse(fixture.store.browse()).entries[0].id;
@@ -137,7 +137,6 @@ it("streams at least 130 final members through native singleton merge proofs wit
     for (const request of requests) expect(Buffer.byteLength(JSON.stringify(request), "utf8")).toBeLessThanOrEqual(byteBudget);
     for (const call of calls) expect(Buffer.byteLength(JSON.stringify(call.value), "utf8")).toBeLessThan(48 * 1024);
     expect(JSON.stringify(requests)).not.toContain("artifact://");
-    expect(fixture.nativePeak).toBeLessThanOrEqual(fixture.concurrency);
     expect(fixture.errors).toEqual([]);
   } finally { await fixture.close(); }
 }, 300_000);

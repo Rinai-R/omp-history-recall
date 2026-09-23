@@ -10,7 +10,7 @@ const { values } = parseArgs({ options: {
 const count = Number(values.conversations);
 if (!Number.isSafeInteger(count) || count < 1 || count > 2000) throw new Error("--conversations must be from 1 to 2000.");
 
-const fixture = await createRuntimeFixture({ seedConversations: false, concurrency: 3 });
+const fixture = await createRuntimeFixture({ seedConversations: false });
 const { store, scope, root } = fixture;
 const directory = path.join(scope.sessionsRoot, "corpus");
 const out = path.resolve(values.out!);
@@ -49,7 +49,7 @@ try {
   }
   const coldStart = performance.now();
   await store.discover();
-  const indexed = await store.work(fixture.model, fixture.repairRunner, { concurrency: fixture.concurrency });
+  const indexed = await store.work(fixture.model, fixture.repairRunner);
   accountedCalls = indexed.calls;
   if (indexed.errors.length) {
     throw new Error(`Corpus indexing failed: ${JSON.stringify(indexed.errors)}; fixture calls=${callCounts().total}, completed=${indexed.completed}/${count}.`);
@@ -59,8 +59,8 @@ try {
   const coldMs = performance.now() - coldStart;
   if (store.status().conversations !== count || store.status().topics !== 1) throw new Error("Incomplete or incorrectly clustered corpus.");
   const calls = callCounts();
-  if (accountedCalls !== calls.total || fixture.peak > fixture.concurrency) {
-    throw new Error("Native fixture call accounting or concurrency bound was violated.");
+  if (accountedCalls !== calls.total) {
+    throw new Error("Native fixture call accounting was violated.");
   }
   if (count > 1 && (!calls.native || !fixture.nativeToolCalls.some(call => call.name === "repair_read"))) {
     throw new Error("Historical maintenance did not execute through the native evidence tools.");
@@ -92,7 +92,7 @@ try {
     kind: "offline-conversation-index-benchmark", completed: true, semantic_quality_evaluated: false,
     external_model_calls: 0, fixture_model_calls: calls.total, analysis_calls: calls.analysis, selection_calls: calls.selection,
     native_calls: calls.native, accounted_calls: accountedCalls, peak_concurrency: fixture.peak,
-    native_peak_concurrency: fixture.nativePeak, concurrency_limit: fixture.concurrency,
+    native_peak_concurrency: fixture.nativePeak,
     conversations: count, topics: store.status().topics,
     indexed_entries: store.status().indexed_entries, cold_index_ms: coldMs,
     catalog_ms: catalogMs, search_ms: { p50: percentile(searchMs, .5), p95: percentile(searchMs, .95) },

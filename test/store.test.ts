@@ -83,11 +83,12 @@ function gatedModel(count: number, contextWindow = 8192) {
   const started = Promise.withResolvers<void>();
   const controlled = model(async (_request, fallback) => {
     const index = controlled.requests.length - 1;
-    if (controlled.requests.length === count) started.resolve();
+    started.resolve();
     return index < gates.length ? gates[index].promise : fallback;
   }, { contextWindow, maxOutputTokens: 1024 });
   return {
     ...controlled, gates, started: started.promise,
+    async waitForNth(total: number) { while (controlled.requests.length < total) await tick(); },
     get peak() { return controlled.peak; },
     resolve(index: number) { gates[index].resolve(response(controlled.requests[index])); },
     release() { gates.forEach((gate, index) => gate.resolve(controlled.requests[index] ? response(controlled.requests[index]) : {})); },
@@ -679,9 +680,9 @@ describe("complete queued work, cache recovery and publication isolation", () =>
       return fallback;
     }, { contextWindow: 8192, maxOutputTokens: 1024 });
     await store.discover({ file });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1 })).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "index_error" }] });
+    expect(await store.work(controlled.fixture, keepRepair, {})).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "index_error" }] });
     const [valid, failed] = controlled.requests.map(request => JSON.stringify(request));
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1 })).toMatchObject({ completed: 1, failed: 0, calls: controlled.requests.length - 2 });
+    expect(await store.work(controlled.fixture, keepRepair, {})).toMatchObject({ completed: 1, failed: 0, calls: controlled.requests.length - 2 });
     expect(controlled.requests.filter(request => JSON.stringify(request) === valid)).toHaveLength(1);
     expect(controlled.requests.filter(request => JSON.stringify(request) === failed)).toHaveLength(2);
     expect(store.status().indexing_calls_today).toBe(controlled.requests.length);
@@ -705,95 +706,63 @@ describe("complete queued work, cache recovery and publication isolation", () =>
       ? { ...fallback, facets: [{ ...descriptor("storage"), evidence_entry_ids: ["not-an-entry"] }] } : fallback,
     { contextWindow: 8192, maxOutputTokens: 1024 });
     await store.discover({ file });
-    expect(await store.work(controlled.fixture, keepRepair, { concurrency: 1 })).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "invalid_model_output" }] });
+    expect(await store.work(controlled.fixture, keepRepair, {})).toMatchObject({ completed: 0, failed: 1, calls: 2, errors: [{ code: "invalid_model_output" }] });
     const [valid, invalid] = controlled.requests.map(request => JSON.stringify(request));
     await index(store, controlled.fixture, file, true);
     expect(controlled.requests.filter(request => JSON.stringify(request) === valid)).toHaveLength(1);
     expect(controlled.requests.filter(request => JSON.stringify(request) === invalid)).toHaveLength(2);
   });
 
-  it("retains late good siblings and evicts every malformed sibling after an out-of-order failure", async () => {
+  it("stops at the first malformed analysis response and reuses earlier valid chunks on retry", async () => {
     const { root, directory, store } = await setup();
     const file = await writeLargeSession(directory, root);
     const gated = gatedModel(3);
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { concurrency: 3 });
+    const work = store.work(gated.fixture, keepRepair, {});
     cleanup.push(async () => { gated.release(); await work; });
-    let settled = false;
-    void work.then(() => { settled = true; });
     await gated.started;
-    gated.gates[1].resolve({ summary: "Invalid evidence", facets: [{ ...descriptor("storage"), evidence_entry_ids: ["invented"] }] });
-    await tick();
-    expect(settled).toBeFalse();
-    gated.resolve(0);
-    await tick();
-    expect(settled).toBeFalse();
-    gated.gates[2].resolve({ summary: "Invalid facet collection", facets: "not an array" });
-    expect(await work).toMatchObject({ completed: 0, failed: 1, calls: 3, errors: [{ code: "invalid_model_output" }] });
-    const [valid, invalidFirst, invalidLast] = gated.requests.map(request => JSON.stringify(request));
+    gated.gates[0].resolve({ summary: "Invalid evidence", facets: [{ ...descriptor("storage"), evidence_entry_ids: ["invented"] }] });
+    expect(await work).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "invalid_model_output" }] });
     await store.discover({ file, force: true });
-    expect(await store.work(gated.fixture, keepRepair, { concurrency: 2 })).toMatchObject({ completed: 1, failed: 0 });
-    expect(gated.requests.filter(request => JSON.stringify(request) === valid)).toHaveLength(1);
-    expect(gated.requests.filter(request => JSON.stringify(request) === invalidFirst)).toHaveLength(2);
-    expect(gated.requests.filter(request => JSON.stringify(request) === invalidLast)).toHaveLength(2);
-    expect(store.status().indexing_calls_today).toBe(gated.requests.length);
+    const retried = model();
+    expect(await store.work(retried.fixture, keepRepair, {})).toMatchObject({ completed: 1, failed: 0 });
+    expect(retried.requests.length).toBeGreaterThan(1);
+    expect((retried.requests[0] as AnalysisRequest).stage).toBe("analysis_map");
+    expect(store.status().indexing_calls_today).toBe(1 + retried.requests.length);
   });
 
-  it("meters overlapping calls while retaining the configured concurrency bound", async () => {
+  it("meters every sequential metered call in one invocation", async () => {
     const { root, directory, store } = await setup();
     const file = await writeLargeSession(directory, root);
-    const gated = gatedModel(5);
+    const controlled = model(undefined, { contextWindow: 8192, maxOutputTokens: 1024 });
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { concurrency: 5 });
-    cleanup.push(async () => { gated.release(); await work; });
-    let settled = false;
-    void work.then(() => { settled = true; });
-    await gated.started;
-    await tick();
-    expect(gated.requests).toHaveLength(5);
-    expect(store.status().indexing_calls_today).toBe(5);
-    expect(settled).toBeFalse();
-    gated.release();
-    const result = await work;
-    expect(result).toMatchObject({ completed: 1, failed: 0, calls: gated.requests.length, errors: [] });
-    expect(store.status().indexing_calls_today).toBe(gated.requests.length);
-    expect(gated.peak).toBe(5);
+    const result = await store.work(controlled.fixture, keepRepair, {});
+    expect(result).toMatchObject({ completed: 1, failed: 0, calls: controlled.requests.length, errors: [] });
+    expect(result.calls).toBeGreaterThan(1);
+    expect(store.status().indexing_calls_today).toBe(controlled.requests.length);
+    expect(controlled.peak).toBe(1);
   });
 
-  it("keeps the claimed lease after provider failure until all in-flight siblings settle", async () => {
+  it("releases the claimed lease only after the failing provider call settles", async () => {
     const { root, directory, scope, access, store } = await setup();
     const file = await writeLargeSession(directory, root);
     const competitor = connection(store, scope, access);
     const gated = gatedModel(3);
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { file, concurrency: 3 });
+    const work = store.work(gated.fixture, keepRepair, { file });
     cleanup.push(async () => { gated.release(); await work; });
-    let settled = false;
-    void work.then(() => { settled = true; });
     await gated.started;
     const lease = store.db.query<{ token: string; lease_until: number; error: string | null }, [string, string]>(
       "SELECT token,lease_until,error FROM hr_jobs WHERE scope_id=? AND file=?");
     const owned = lease.get(scope.id, file)!;
     expect(owned.lease_until).toBeGreaterThan(Date.now());
-    gated.gates[0].reject(new Error("Provider unavailable"));
-    await tick();
-    expect(settled).toBeFalse();
-    expect(lease.get(scope.id, file)).toEqual(owned);
     await competitor.discover({ file, force: true });
     expect(await competitor.work(model().fixture, keepRepair, { file })).toMatchObject({ completed: 0, calls: 0 });
-    gated.resolve(2);
-    await tick();
-    expect(settled).toBeFalse();
-    expect(lease.get(scope.id, file)).toEqual(owned);
-    gated.resolve(1);
-    expect(await work).toMatchObject({ completed: 0, failed: 1, calls: 3, errors: [{ code: "index_error" }] });
+    gated.gates[0].reject(new Error("Provider unavailable"));
+    expect(await work).toMatchObject({ completed: 0, failed: 1, calls: 1, errors: [{ code: "index_error" }] });
     expect(lease.get(scope.id, file)).toMatchObject({ token: "", lease_until: 0, error: "index_error" });
-    const [failed, second, third] = gated.requests.map(request => JSON.stringify(request));
     await store.discover({ file, force: true });
-    expect(await competitor.work(gated.fixture, keepRepair, { file, concurrency: 3 })).toMatchObject({ completed: 1, failed: 0 });
-    expect(gated.requests.filter(request => JSON.stringify(request) === failed)).toHaveLength(2);
-    expect(gated.requests.filter(request => JSON.stringify(request) === second)).toHaveLength(1);
-    expect(gated.requests.filter(request => JSON.stringify(request) === third)).toHaveLength(1);
+    expect(await competitor.work(model().fixture, keepRepair, { file })).toMatchObject({ completed: 1, failed: 0 });
   });
 
   it("rejects a captured revision conflict without publishing and reuses analysis on the next explicit attempt", async () => {
@@ -1076,16 +1045,6 @@ describe("authorized sources, identity and snapshots", () => {
     expect(conversations(store).map(item => item.session_id)).toEqual(["s1"]);
   });
 
-  it("rejects invalid concurrency before claiming work and changing active identity on a live store", async () => {
-    const { root, directory, store } = await setup();
-    const file = await writeSession(directory, root);
-    await store.discover({ file });
-    await expect(store.work(model().fixture, keepRepair, { file: path.join(root, "missing.jsonl"), concurrency: 0 })).rejects.toMatchObject({ code: "invalid_concurrency" });
-    let identityError: unknown;
-    try { store.setSourceAccess({ activeSessionId: "different" }); } catch (error) { identityError = error; }
-    expect(identityError).toMatchObject({ code: "scope_conflict" });
-    expect(await store.work(model().fixture, keepRepair, { file })).toMatchObject({ completed: 1, failed: 0 });
-  });
 
   it("rejects schemas 3 and 4 and nonempty unversioned databases without modifying their contents", async () => {
     const { root, scope, access } = await setup();
@@ -1108,30 +1067,21 @@ describe("authorized sources, identity and snapshots", () => {
 });
 
 describe("bounded selection and complete repair paging", () => {
-  it("preserves facet associations across out-of-order bounded selection calls", async () => {
+  it("preserves facet associations across strictly ordered bounded selection calls", async () => {
     const { root, directory, store } = await setup();
     for (const scope of ["A", "B", "C"]) await index(store, model().fixture,
       await writeSession(directory, root, `seed-${scope}`, [`Discussion scope: ${scope}.`]));
     const requests: SelectRequest[] = [];
-    const entered = Promise.withResolvers<void>();
-    const gates = [Promise.withResolvers<unknown>(), Promise.withResolvers<unknown>()];
     const controlled = model(async (request, fallback) => {
       if (request.stage !== "select_topic") return fallback;
-      const slot = requests.push(request) - 1;
-      if (slot === 1) entered.resolve();
-      return slot < 2 ? gates[slot].promise : fallback;
-    }, { identity: "out-of-order-selection" });
+      requests.push(request);
+      return fallback;
+    }, { identity: "ordered-selection" });
     const file = await writeSession(directory, root, "incoming", ["Discussion scope: A.", "Discussion scope: B.", "Discussion scope: C."]);
     await store.discover({ file });
-    const work = store.work(controlled.fixture, keepRepair, { file, concurrency: 2 });
-    cleanup.push(async () => { gates.forEach((gate, slot) => gate.resolve(requests[slot] ? response(requests[slot]) : {})); await work; });
-    await Promise.race([entered.promise, work.then(() => { throw new Error("Work ended before concurrent selection calls"); })]);
-    expect(requests).toHaveLength(2);
-    gates[1].resolve(response(requests[1]));
-    await tick();
-    gates[0].resolve(response(requests[0]));
+    const work = store.work(controlled.fixture, keepRepair, { file });
     expect(await work).toMatchObject({ completed: 1, failed: 0 });
-    expect(controlled.peak).toBe(2);
+    expect(controlled.peak).toBe(1);
     expect(conversation(store, "incoming").memberships.map(member => member.topic_id)).toEqual([topicOf(store, "seed-A"), topicOf(store, "seed-B"), topicOf(store, "seed-C")]);
   });
 
@@ -1154,7 +1104,7 @@ describe("bounded selection and complete repair paging", () => {
     const file = await writeSession(directory, root, "incoming");
     await store.discover({ file });
     const revision = store.status().revision;
-    const work = store.work(controlled.fixture, repair, { file, concurrency: 2 });
+    const work = store.work(controlled.fixture, repair, { file });
     cleanup.push(async () => { release.resolve(); await work; });
     await Promise.race([entered.promise, work.then(() => { throw new Error("Work ended before the second coverage block"); })]);
     expect(checked).toHaveLength(65);
@@ -1286,28 +1236,27 @@ describe("deferred history and atomic repair source guards", () => {
 });
 
 describe("cancelled and changing source work", () => {
-  it("drains admitted calls on cancellation without publishing or losing the job prematurely", async () => {
+  it("keeps the lease until the in-flight call settles after cancellation", async () => {
     const { root, directory, scope, store } = await setup();
     const file = await writeLargeSession(directory, root);
     const gated = gatedModel(3);
     const controller = new AbortController();
     await store.discover({ file });
-    const work = store.work(gated.fixture, keepRepair, { file, signal: controller.signal, concurrency: 3 });
+    const work = store.work(gated.fixture, keepRepair, { file, signal: controller.signal });
     const outcome = work.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
     cleanup.push(async () => { gated.release(); await outcome; });
     await gated.started;
     const owned = store.db.query<{ token: string; lease_until: number }, [string, string]>("SELECT token,lease_until FROM hr_jobs WHERE scope_id=? AND file=?").get(scope.id, file)!;
     controller.abort(new Error("cancel indexing"));
-    gated.resolve(1);
     await tick();
+    // The single in-flight call still holds the lease while it settles.
     expect(store.db.query("SELECT token,lease_until FROM hr_jobs WHERE scope_id=? AND file=?").get(scope.id, file)).toEqual(owned);
     expect(store.status().conversations).toBe(0);
     gated.resolve(0);
-    gated.resolve(2);
     const cancelled = await outcome;
     expect(cancelled.value).toBeUndefined();
     expect(cancelled.error).toBe(controller.signal.reason);
-    expect(store.status()).toMatchObject({ conversations: 0, topics: 0, indexing_calls_today: 3 });
+    expect(store.status()).toMatchObject({ conversations: 0, topics: 0, indexing_calls_today: 1 });
     expect(store.db.query("SELECT token,lease_until,attempts,error FROM hr_jobs WHERE scope_id=? AND file=?").get(scope.id, file))
       .toEqual({ token: "", lease_until: 0, attempts: 0, error: "cancelled" });
   });

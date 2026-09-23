@@ -4,7 +4,6 @@ import { ompModel, resolveRecallModel, type ModelMetric } from "./omp-model";
 import { ompRepairRunner } from "./omp-repair";
 import { RecallError } from "./source";
 import { HistoryStore, type IndexResult } from "./store";
-import { DEFAULT_INDEX_CONCURRENCY, validateConcurrency } from "./concurrency";
 import { resolveRecallScope } from "./scope";
 
 import { announce, IndexProgress } from "./progress";
@@ -59,7 +58,6 @@ export class HistoryRuntime {
 
   async index(ctx: ExtensionContext, options: IndexOptions = {}): Promise<IndexResult> {
     options.signal?.throwIfAborted();
-    const concurrency = validateConcurrency(Number(process.env.OMP_HISTORY_RECALL_CONCURRENCY ?? DEFAULT_INDEX_CONCURRENCY));
     const file = options.file;
     if (file !== undefined && !path.isAbsolute(file)) throw new RecallError("invalid_file", "Use the absolute source_file returned by history_recall_conversations.");
     const state = await this.state(ctx);
@@ -94,7 +92,6 @@ export class HistoryRuntime {
       const repair = ompRepairRunner(ctx, observe, selected);
       return state.store.work(model, repair, {
         file,
-        concurrency,
         signal,
         onProgress: update => progress.update(update),
       });

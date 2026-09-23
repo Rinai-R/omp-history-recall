@@ -7,7 +7,6 @@ import { digest, loadSource, readSourceEvidence, RecallError, type SessionSource
 import { timeRange, type TimeFilter, type TimeRange } from "./time";
 import type { ModelMetric } from "./omp-model";
 import { openHistoryDatabase } from "./database";
-import { validateConcurrency } from "./concurrency";
 import { enumerateSources, validateSourceFile, type RecallScope, type SourceAccess, type SourceFileInfo, type SourceWarning } from "./scope";
 import { TopicRegistry } from "./topic-registry";
 import { selectTopics, TOPIC_VERSION, type ClusterPlan, type IncomingConversation, type TopicChangeCounts } from "./topics";
@@ -36,7 +35,7 @@ export type WorkProgress = {
   stage: "reading" | "analysis" | "selection" | "preparing_repair" | "repair" | "validating" | "publishing" | "completed" | "failed";
   file: string; job: number; completed: number; failed: number; calls: number; code?: string;
 };
-export type WorkOptions = { file?: string; concurrency?: number; signal?: AbortSignal; onProgress?: (progress: WorkProgress) => void };
+export type WorkOptions = { file?: string; signal?: AbortSignal; onProgress?: (progress: WorkProgress) => void };
 
 function browseCursor(value: string, binding: string): { offset: number; range: TimeRange } {
   try {
@@ -209,7 +208,6 @@ export class HistoryStore {
   }
 
   async work(model: JsonModel, repair: RepairRunner, options: WorkOptions = {}): Promise<IndexResult> {
-    const concurrency = validateConcurrency(options.concurrency);
     if (options.file !== undefined && !path.isAbsolute(options.file)) throw new RecallError("invalid_file", "Use an absolute source_file from the catalog.");
     const modelBinding = [model.identity, model.contextWindow, model.maxOutputTokens];
     const budget = new ModelBudget(this.db, this.scope.id);
@@ -260,7 +258,7 @@ export class HistoryStore {
             throw new RecallError("invalid_model_output", "Cached conversation analysis does not match this source.");
           }
         } else {
-          analysis = await analyzeConversation(budgeted, source, facts, { signal: options.signal, concurrency });
+          analysis = await analyzeConversation(budgeted, source, facts, { signal: options.signal });
           this.db.run("INSERT OR REPLACE INTO hr_cache VALUES (?,?,?,?)", [this.scope.id, cacheKey, JSON.stringify(analysis), Date.now()]);
         }
         const incoming: IncomingConversation = {
@@ -269,19 +267,19 @@ export class HistoryStore {
           evidenceById: new Map(source.entries.map(({ id, hash }) => [id, { id, hash }])),
         };
         const snapshot = this.registry.snapshot();
-        const modelOptions = { signal: options.signal, concurrency };
+        const modelOptions = { signal: options.signal };
         progress("selection");
         const selection = await selectTopics(budgeted, analysis, snapshot.cards, modelOptions);
         progress("preparing_repair");
         const protocol = new RepairProtocol(this.scope, this.registry, incoming, source, selection, snapshot,
           (id, signal) => this.readRepairSource(id, snapshot.revision, signal),
-          { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens), concurrency });
+          { inputBytes: inputBudget(model.contextWindow, model.maxOutputTokens) });
         protocol.bindModel(model);
         await protocol.prepare(options.signal);
         let completion: RepairCompletion;
         if (protocol.hasUsableHistory) {
           progress("repair");
-          completion = await repair({ protocol, budget, signal: options.signal, concurrency });
+          completion = await repair({ protocol, budget, signal: options.signal });
         } else {
           completion = { proposal_id: null, reason: "No available indexed historical members require maintenance." };
         }

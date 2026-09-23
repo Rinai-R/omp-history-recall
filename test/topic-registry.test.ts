@@ -122,7 +122,7 @@ async function setup() {
       const file = files.get(id);
       if (!file) throw new RecallError("source_missing", "No fixture source for that conversation");
       return loadSource(file, { signal });
-    }, { inputBytes: 200_000, concurrency: 3 });
+    }, { inputBytes: 200_000 });
     await instance.prepare();
     return instance;
   }
