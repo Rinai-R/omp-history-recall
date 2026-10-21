@@ -87,14 +87,7 @@ export function redactJson(raw: string): string {
   return encoded === JSON.stringify(parsed) ? raw : encoded;
 }
 
-function entryText(record: Record<string, unknown>): { role: string; text: string } {
-  if (record.type !== "message") return { role: "", text: "" };
-  const message = object(record.message);
-  if (!message) return { role: "", text: "" };
-  const role = typeof message.role === "string" ? message.role : "";
-  if (!["user", "assistant", "toolResult", "bashExecution", "pythonExecution"].includes(role)) {
-    return { role, text: "" };
-  }
+function messageText(message: Record<string, unknown>): string {
   const parts: string[] = [];
   if (typeof message.toolName === "string" || typeof message.isError === "boolean" || typeof message.exitCode === "number") {
     parts.push(JSON.stringify({ tool: message.toolName, is_error: message.isError, exit_code: message.exitCode }));
@@ -113,7 +106,38 @@ function entryText(record: Record<string, unknown>): { role: string; text: strin
     }
   }
   if (typeof message.output === "string") parts.push(message.output);
-  return { role, text: redact(parts.join("\n")) };
+  return parts.join("\n");
+}
+
+// Only transcript-bearing records enter the search corpus. Titles, labels,
+// system prompts, reasoning, credentials and provider metadata stay out.
+function entryText(record: Record<string, unknown>): { role: string; text: string } {
+  if (record.type === "message") {
+    const message = object(record.message);
+    const role = typeof message?.role === "string" ? message.role as string : "";
+    if (!message || !["user", "assistant", "toolResult", "bashExecution", "pythonExecution"].includes(role)) {
+      return { role, text: "" };
+    }
+    return { role, text: redact(messageText(message)) };
+  }
+  if (record.type === "compaction" && typeof record.summary === "string") {
+    return { role: "compaction", text: redact(record.summary) };
+  }
+  if (record.type === "branch_summary" && typeof record.summary === "string") {
+    return { role: "branch_summary", text: redact(record.summary) };
+  }
+  if (record.type === "custom_message") {
+    const role = `custom:${typeof record.customType === "string" ? record.customType : "message"}`;
+    if (typeof record.content === "string") return { role, text: redact(record.content) };
+    if (Array.isArray(record.content)) {
+      const text = record.content.flatMap(value => {
+        const block = object(value);
+        return block?.type === "text" && typeof block.text === "string" ? [block.text] : [];
+      }).join("\n");
+      return { role, text: redact(text) };
+    }
+  }
+  return { role: "", text: "" };
 }
 
 export async function loadSource(

@@ -1,7 +1,9 @@
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { createRuntimeFixture } from "../test/runtime-fixture";
+import { HistoryStore } from "../src/store";
+import type { RecallScope, SourceAccess } from "../src/scope";
 
 const { values } = parseArgs({ options: {
   conversations: { type: "string", default: "512" },
@@ -10,110 +12,73 @@ const { values } = parseArgs({ options: {
 const count = Number(values.conversations);
 if (!Number.isSafeInteger(count) || count < 1 || count > 2000) throw new Error("--conversations must be from 1 to 2000.");
 
-const fixture = await createRuntimeFixture({ seedConversations: false });
-const { store, scope, root } = fixture;
-const directory = path.join(scope.sessionsRoot, "corpus");
-const out = path.resolve(values.out!);
-let accountedCalls = 0;
-const started = performance.now();
+const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "history-offline-")));
+const sessionsRoot = path.join(root, "agent", "sessions");
+const scope: RecallScope = {
+  id: "scope_offline", agentDir: path.join(root, "agent"),
+  sessionsRoot, customFilesRoot: path.join(root, "agent", "custom-session-files"),
+};
+const access: SourceAccess = { sessionDir: sessionsRoot, activeSessionId: "offline-active" };
+const store = new HistoryStore(path.join(root, "index.db"), scope, access);
 
 function percentile(values: number[], p: number) {
   return [...values].sort((a, b) => a - b)[Math.min(values.length - 1, Math.floor(values.length * p))];
 }
 
-function callCounts() {
-  let analysis = 0;
-  let selection = 0;
-  for (const { input } of fixture.utilityRequests) {
-    if (!input || typeof input !== "object" || !("stage" in input) || typeof input.stage !== "string") continue;
-    if (input.stage.startsWith("analysis_")) analysis++;
-    else if (input.stage === "select_topic") selection++;
-  }
-  return { analysis, selection, native: fixture.nativeRequests.length,
-    total: fixture.utilityRequests.length + fixture.nativeRequests.length };
-}
-
 try {
-  await fs.mkdir(directory, { recursive: true });
-  for (let i = 0; i < count; i++) {
-    const timestamp = new Date(Date.UTC(2026, 8, 1 + i % 20)).toISOString();
-    const records: unknown[] = [{ type: "session", version: 3, id: `session-${i}`, cwd: path.join(root, `cwd-${i % 3}`), timestamp, title: `Corpus ${i}` }];
+  for (let index = 0; index < count; index++) {
+    const timestamp = new Date(Date.UTC(2026, 8, 1 + index % 20)).toISOString();
+    const bucket = path.join(sessionsRoot, `bucket-${index % 8}`);
+    await fs.mkdir(bucket, { recursive: true });
+    const records: unknown[] = [{ type: "session", version: 3, id: `session-${index}`, cwd: root, timestamp, title: `Corpus ${index}` }];
     let parent: string | null = null;
-    for (let j = 0; j < 8; j++) {
-      const user = `u${i}_${j}`, assistant = `a${i}_${j}`;
-      records.push({ type: "message", id: user, parentId: parent, timestamp, message: { role: "user", content: `evidence${i}slot${j} durable writes and replay correctness 存储恢复` } });
+    for (let slot = 0; slot < 8; slot++) {
+      const user = `u${index}_${slot}`, assistant = `a${index}_${slot}`;
+      records.push({ type: "message", id: user, parentId: parent, timestamp, message: { role: "user", content: `evidence${index}slot${slot} durable writes and replay correctness 存储恢复` } });
       records.push({ type: "message", id: assistant, parentId: user, timestamp, message: { role: "assistant", content: "Outcome unresolved; read the original." } });
       parent = assistant;
     }
-    await fs.writeFile(path.join(directory, `${String(i).padStart(6, "0")}.jsonl`), records.map(record => JSON.stringify(record)).join("\n") + "\n");
+    await fs.writeFile(path.join(bucket, `${String(index).padStart(6, "0")}.jsonl`),
+      records.map(record => JSON.stringify(record)).join("\n") + "\n");
   }
   const coldStart = performance.now();
-  await store.discover();
-  const indexed = await store.work(fixture.model, fixture.repairRunner);
-  accountedCalls = indexed.calls;
-  if (indexed.errors.length) {
-    throw new Error(`Corpus indexing failed: ${JSON.stringify(indexed.errors)}; fixture calls=${callCounts().total}, completed=${indexed.completed}/${count}.`);
-  }
-  if (indexed.completed !== count) throw new Error(`Corpus indexing completed ${indexed.completed}/${count} conversations.`);
-  if (indexed.repair_deferred.length) throw new Error(`Fresh local corpus unexpectedly deferred sources: ${JSON.stringify(indexed.repair_deferred)}`);
+  const cold = await store.sync({ maxFiles: count, maxBytes: 1_073_741_824 });
   const coldMs = performance.now() - coldStart;
-  if (store.status().conversations !== count || store.status().topics !== 1) throw new Error("Incomplete or incorrectly clustered corpus.");
-  const calls = callCounts();
-  if (accountedCalls !== calls.total) {
-    throw new Error("Native fixture call accounting was violated.");
-  }
-  if (count > 1 && (!calls.native || !fixture.nativeToolCalls.some(call => call.name === "repair_read"))) {
-    throw new Error("Historical maintenance did not execute through the native evidence tools.");
+  if (cold.failed || cold.ingested !== count) {
+    throw new Error(`Incomplete corpus ingestion: ${JSON.stringify(cold)}`);
   }
   const warmStart = performance.now();
-  const catalogFiles = new Set<string>();
-  let cursor: string | undefined;
-  do {
-    const catalog = await store.catalog({ cursor, limit: 50 });
-    if (catalog.warnings.length) throw new Error(`Catalog warnings: ${JSON.stringify(catalog.warnings)}`);
-    for (const conversation of catalog.conversations) {
-      if (!conversation.indexed || catalogFiles.has(conversation.source_file)) throw new Error("Catalog lost or duplicated an indexed conversation.");
-      catalogFiles.add(conversation.source_file);
-    }
-    cursor = catalog.next_cursor ?? undefined;
-  } while (cursor);
-  const catalogMs = performance.now() - warmStart;
-  if (catalogFiles.size !== count) throw new Error("Paged catalog did not cover the full corpus.");
+  const warm = await store.sync({ maxFiles: count, maxBytes: 1_073_741_824 });
+  const warmMs = performance.now() - warmStart;
+  if (warm.ingested !== 0 || warm.pending !== 0) throw new Error("Unchanged corpus was re-ingested.");
+  const catalogStart = performance.now();
+  const catalog = await store.catalog({ limit: 50 });
+  const catalogMs = performance.now() - catalogStart;
+  if (catalog.conversations.length !== 50) throw new Error("Catalog pagination lost entries.");
   const searchMs: number[] = [];
-  for (let i = 0; i < Math.min(count, 100); i++) {
-    const index = (i * 31) % count;
+  for (let index = 0; index < Math.min(count, 100); index++) {
+    const selected = (index * 31) % count;
     const start = performance.now();
-    const result = await store.search([`evidence${index}slot3`]);
+    const result = await store.search([`evidence${selected}slot3`]);
     searchMs.push(performance.now() - start);
-    if (result.conversations.length !== 1 || result.conversations[0].session_id !== `session-${index}`) throw new Error("Wrong search result.");
+    if (result.conversations.length !== 1 || result.conversations[0].session_id !== `session-${selected}`) {
+      throw new Error("Wrong search result.");
+    }
   }
-  if (fixture.errors.length) throw new AggregateError(fixture.errors, "Local SDK fixture reported runtime errors");
+  const status = await store.status();
+  if (status.conversations !== count) throw new Error(`Indexed ${status.conversations}/${count} conversations.`);
   const metrics = {
-    kind: "offline-conversation-index-benchmark", completed: true, semantic_quality_evaluated: false,
-    external_model_calls: 0, fixture_model_calls: calls.total, analysis_calls: calls.analysis, selection_calls: calls.selection,
-    native_calls: calls.native, accounted_calls: accountedCalls, peak_concurrency: fixture.peak,
-    native_peak_concurrency: fixture.nativePeak,
-    conversations: count, topics: store.status().topics,
-    indexed_entries: store.status().indexed_entries, cold_index_ms: coldMs,
-    catalog_ms: catalogMs, search_ms: { p50: percentile(searchMs, .5), p95: percentile(searchMs, .95) },
+    kind: "offline-fts-session-index-benchmark", model_calls: 0,
+    conversations: count, indexed_entries: status.indexed_entries,
+    cold_ingest_ms: coldMs, warm_ingest_ms: warmMs, catalog_ms: catalogMs,
+    search_ms: { p50: percentile(searchMs, .5), p95: percentile(searchMs, .95) },
     db_bytes: (await fs.stat(store.dbPath)).size, bun: Bun.version, timestamp: new Date().toISOString(),
   };
+  const out = path.resolve(values.out!);
   await fs.mkdir(path.dirname(out), { recursive: true });
   await fs.writeFile(out, JSON.stringify(metrics, null, 2));
   console.log(JSON.stringify(metrics, null, 2));
-} catch (error) {
-  const calls = callCounts();
-  const failure = {
-    kind: "offline-conversation-index-benchmark", completed: false, semantic_quality_evaluated: false,
-    requested_conversations: count, indexed_conversations: store.status().conversations,
-    fixture_model_calls: calls.total, analysis_calls: calls.analysis, selection_calls: calls.selection, native_calls: calls.native,
-    accounted_calls: accountedCalls, peak_concurrency: fixture.peak,
-    elapsed_ms: performance.now() - started, error: error instanceof Error ? error.message : String(error),
-  };
-  await fs.mkdir(path.dirname(out), { recursive: true });
-  await fs.writeFile(out, JSON.stringify(failure, null, 2));
-  console.error(JSON.stringify(failure, null, 2));
-  throw error;
 } finally {
-  await fixture.close();
+  store.close();
+  await fs.rm(root, { recursive: true, force: true });
 }
