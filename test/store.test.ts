@@ -177,6 +177,35 @@ describe("FTS session index", () => {
     await expect(store.catalog({ limit: 50, cursor: first.next_cursor! })).rejects.toMatchObject({ code: "stale_cursor" });
   });
 
+  it("paginates search results deterministically and rejects stale cursors", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    for (let index = 0; index < 60; index++) {
+      const id = `s${String(index).padStart(2, "0")}`;
+      await writeSession(path.join(sessionsRoot, "bulk"), id, id, root, conversation(id));
+    }
+    await store.sync({ maxFiles: 100 });
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = await store.search(["WAL"], { limit: 25, cursor });
+      expect(page.conversations.length).toBeLessThanOrEqual(25);
+      for (const hit of page.conversations) {
+        expect(seen.has(hit.id)).toBeFalse();
+        seen.add(hit.id);
+      }
+      cursor = page.next_cursor ?? undefined;
+      pages++;
+    } while (cursor && pages < 5);
+    expect(seen.size).toBe(60);
+    expect(pages).toBe(3);
+
+    const first = await store.search(["WAL"], { limit: 25 });
+    await writeSession(path.join(sessionsRoot, "bulk"), "late", "late", root, conversation("late"));
+    await expect(store.search(["WAL"], { limit: 25, cursor: first.next_cursor! }))
+      .rejects.toMatchObject({ code: "stale_cursor" });
+  });
+
   it("rejects incompatible derived databases with a rebuild instruction", async () => {
     const { root } = await setup();
     const file = path.join(root, "old.db");

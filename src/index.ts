@@ -56,6 +56,7 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
     source_cwd: pi.zod.string().optional().describe("Only sessions started from this exact working directory"),
     conversation_id: pi.zod.string().optional(),
     limit: limitField,
+    cursor: pi.zod.string().optional().describe("next_cursor from a previous search with identical filters"),
   });
   const readSchema = pi.zod.object({
     conversation_id: pi.zod.string().min(1),
@@ -82,7 +83,7 @@ export default function historyRecallExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "history_recall_search", label: "Search indexed history",
-    description: "Full-text search over indexed original conversation text in the current OMP profile. Returns conversations and matched entry IDs, not established facts. New sessions are ingested incrementally; pending_files means more remain.",
+    description: "Full-text search over indexed original conversation text in the current OMP profile. Returns conversations and matched entry IDs, not established facts. Follow next_cursor to page. New sessions are ingested incrementally; pending_files means more remain.",
     parameters: searchSchema, approval: "read", strict: true, loadMode: "essential",
     async execute(_id, params, signal, _update, ctx) {
       try {

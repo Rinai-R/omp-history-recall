@@ -31,7 +31,7 @@ export type SyncResult = {
   warnings: SourceWarning[]; failures: SyncFailure[];
 };
 export type SearchOptions = TimeFilter & {
-  source_cwd?: string; conversation_id?: string; limit?: number; signal?: AbortSignal;
+  source_cwd?: string; conversation_id?: string; limit?: number; cursor?: string; signal?: AbortSignal;
 };
 export type PresentedConversation = {
   id: string; session_id: string; title: string; description: string;
@@ -42,8 +42,8 @@ export type PresentedConversation = {
 export type SearchHit = PresentedConversation & { matched_entry_ids: string[]; lexical_hits: number };
 export type SearchResult = {
   mode: "lexical"; range: TimeRange; pending_files: number; failures: SyncFailure[];
-  warnings: SourceWarning[]; candidate_limit_reached: boolean; evidence_required: true;
-  conversations: SearchHit[];
+  warnings: SourceWarning[]; evidence_required: true;
+  conversations: SearchHit[]; next_cursor: string | null;
 };
 
 /** Characters that can form FTS tokens; Han text is indexed as overlapping bigrams. */
@@ -62,16 +62,20 @@ function pageLimit(value = 10): number {
   return value;
 }
 
-function catalogOffset(cursor: string, binding: string): number {
-  if (cursor.length > 1024) throw new RecallError("stale_cursor", "Catalog cursor is too long.");
+function decodeOffsetCursor(cursor: string, binding: string): number {
+  if (cursor.length > 1024) throw new RecallError("stale_cursor", "Cursor is too long.");
   try {
     const value: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString());
     if (!value || typeof value !== "object" || !("b" in value) || value.b !== binding
       || !("o" in value) || typeof value.o !== "number" || !Number.isSafeInteger(value.o) || value.o < 0) throw new Error();
     return value.o;
   } catch {
-    throw new RecallError("stale_cursor", "Catalog changed, filters differ, or cursor is invalid; restart without a cursor.");
+    throw new RecallError("stale_cursor", "Index changed, filters differ, or cursor is invalid; restart without a cursor.");
   }
+}
+
+function encodeOffsetCursor(binding: string, offset: number): string {
+  return Buffer.from(JSON.stringify({ b: binding, o: offset })).toString("base64url");
 }
 
 function present(row: ConversationRow): PresentedConversation {
@@ -270,7 +274,7 @@ export class HistoryStore {
     return this.db.transaction(() => {
       const binding = digest(JSON.stringify([this.scope.id, this.access.activeFile, this.excludedSessionId, limit,
         this.revision(), files.map(file => [file.source_file, file.mtime_ms, file.size_bytes])]));
-      const offset = options.cursor ? catalogOffset(options.cursor, binding) : 0;
+      const offset = options.cursor ? decodeOffsetCursor(options.cursor, binding) : 0;
       const indexed = new Map(this.db.query<ConversationRow, [string]>(
         "SELECT * FROM hr_conversations WHERE scope_id=?").all(this.scope.id).map(row => [row.file, row]));
       const visible = files.filter(file => indexed.get(file.source_file)?.session_id !== this.excludedSessionId);
@@ -287,8 +291,7 @@ export class HistoryStore {
       });
       return {
         scope_id: this.scope.id, conversations, warnings,
-        next_cursor: offset + limit < visible.length
-          ? Buffer.from(JSON.stringify({ b: binding, o: offset + limit })).toString("base64url") : null,
+        next_cursor: offset + limit < visible.length ? encodeOffsetCursor(binding, offset + limit) : null,
       };
     })();
   }
@@ -306,6 +309,12 @@ export class HistoryStore {
     if (terms.length === 0) throw new RecallError("invalid_query", "queries contain no searchable terms.");
     const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
     const range = timeRange(options);
+    const limit = pageLimit(options.limit);
+    const binding = digest(JSON.stringify([
+      this.scope.id, this.excludedSessionId, terms, range.from, range.to,
+      options.source_cwd ?? null, options.conversation_id ?? null, limit, this.revision(),
+    ]));
+    const offset = options.cursor ? decodeOffsetCursor(options.cursor, binding) : 0;
     const predicate = {
       sql: `c.scope_id=? AND c.session_id<>? AND (? IS NULL OR c.last_active_at>=?) AND (? IS NULL OR c.started_at<?)
         AND (? IS NULL OR c.source_cwd=?) AND (? IS NULL OR c.id=?)`,
@@ -317,11 +326,11 @@ export class HistoryStore {
         SELECT c.id,COUNT(*) AS hits FROM hr_search f
         JOIN hr_conversations c ON c.scope_id=f.scope_id AND c.id=f.conversation_id
         WHERE hr_search MATCH ? AND ${predicate.sql}
-        GROUP BY c.id ORDER BY hits DESC,c.last_active_at DESC LIMIT 200`)
-        .all(match, ...predicate.args) as { id: string; hits: number }[];
+        GROUP BY c.id ORDER BY hits DESC,c.last_active_at DESC,c.id LIMIT ? OFFSET ?`)
+        .all(match, ...predicate.args, limit + 1, offset) as { id: string; hits: number }[];
       return {
         rows,
-        conversations: rows.map(row => {
+        conversations: rows.slice(0, limit).map(row => {
           const conversation = this.db.query<ConversationRow, [string, string]>(
             "SELECT * FROM hr_conversations WHERE scope_id=? AND id=?").get(this.scope.id, row.id)!;
           const matched = this.db.query<{ entry_id: string }, [string, string, string]>(`
@@ -334,8 +343,9 @@ export class HistoryStore {
     })();
     return {
       mode: "lexical", range, pending_files: sync.pending, failures: sync.failures,
-      warnings: sync.warnings, candidate_limit_reached: rows.length > 50,
-      conversations: conversations.slice(0, pageLimit(options.limit)), evidence_required: true,
+      warnings: sync.warnings, conversations,
+      next_cursor: rows.length > limit ? encodeOffsetCursor(binding, offset + limit) : null,
+      evidence_required: true,
     };
   }
 
