@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { digest, lexicalTerms, loadSource, readSourceEvidence, RecallError, type SessionSource } from "./source";
+import { digest, lexicalTerms, loadSource, readSessionHeader, readSourceEvidence, RecallError, type SessionSource } from "./source";
 import { timeRange, type TimeFilter, type TimeRange } from "./time";
 import { openHistoryDatabase } from "./database";
 import {
@@ -51,16 +51,22 @@ export type SyncResult = {
 };
 export type SearchOptions = TimeFilter & {
   source_cwd?: string; conversation_id?: string; session_id?: string;
+  kinds?: readonly string[]; match?: "any" | "phrase";
   limit?: number; cursor?: string; signal?: AbortSignal;
 };
-export type CurrentSessionMatch = { entry_id: string; line: number; timestamp: string; kind: string };
+export type CurrentSessionMatch = {
+  entry_id: string; line: number; timestamp: string; kind: string; snippet: string | null;
+};
 export type PresentedConversation = {
   id: string; session_id: string; title: string; description: string;
   started_at: string; last_active_at: string; entry_count: number; message_count: number;
   user_turn_count: number; branch_count: number; size_bytes: number;
   source_file: string; source_cwd: string;
 };
-export type SearchHit = PresentedConversation & { matched_entry_ids: string[]; lexical_hits: number };
+export type SearchHit = PresentedConversation & {
+  matched_entry_ids: string[]; lexical_hits: number;
+  snippet_entry_id: string | null; snippet: string | null;
+};
 export type SearchResult = {
   mode: "lexical" | "current-session";
   range: TimeRange; pending_files: number; failures: SyncFailure[];
@@ -72,6 +78,22 @@ export type SearchResult = {
   indexed_entries?: number;
   matched_entry_ids?: string[];
   matches?: CurrentSessionMatch[];
+  snippet_entry_id?: string | null;
+  snippet?: string | null;
+};
+export type SessionTraceNode = {
+  session_id: string; conversation_id: string | null; title: string | null;
+  parent_session: string | null; relation: "target" | "ancestor" | "descendant"; depth: number;
+};
+export type SessionTrace = {
+  mode: "session-trace"; session_id: string;
+  ancestors: SessionTraceNode[]; descendants: SessionTraceNode[]; truncated: boolean;
+};
+export type EventTraceNode = { entry_id: string; timestamp: string; kind: string; line: number };
+export type EventTrace = {
+  mode: "event-trace"; conversation_id: string | null; session_id: string;
+  target: EventTraceNode; ancestors: EventTraceNode[];
+  children: EventTraceNode[]; alternate_branches: string[]; truncated: boolean;
 };
 
 function pageLimit(value = 10): number {
@@ -93,6 +115,31 @@ function decodeOffsetCursor(cursor: string, binding: string): number {
 
 function encodeOffsetCursor(binding: string, offset: number): string {
   return Buffer.from(JSON.stringify({ b: binding, o: offset })).toString("base64url");
+}
+
+/** Bounded plain-text excerpt around the earliest matching term. */
+function makeSnippet(text: string, terms: readonly string[], maxChars = 240): string | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  const lower = normalized.toLowerCase();
+  let at = -1;
+  for (const term of terms) {
+    const index = lower.indexOf(term.toLowerCase());
+    if (index >= 0 && (at < 0 || index < at)) at = index;
+  }
+  if (at < 0) return normalized.length > maxChars ? `${normalized.slice(0, maxChars)}…` : normalized;
+  const start = Math.max(0, at - 100);
+  const end = Math.min(normalized.length, start + maxChars);
+  return `${start > 0 ? "…" : ""}${normalized.slice(start, end)}${end < normalized.length ? "…" : ""}`;
+}
+
+function normalizeKinds(kinds: readonly string[] | undefined): string[] | undefined {
+  if (kinds === undefined) return undefined;
+  const values = [...new Set(kinds.map(kind => kind.trim()).filter(Boolean))];
+  if (values.length === 0 || values.length > 20 || values.some(kind => kind.length > 50)) {
+    throw new RecallError("invalid_query", "kinds must contain 1 to 20 non-empty values of at most 50 characters.");
+  }
+  return values;
 }
 
 function present(row: ConversationRow): PresentedConversation {
@@ -218,33 +265,50 @@ export class HistoryStore {
   }
 
   private scanCurrentMatches(
-    source: SessionSource, terms: readonly string[], limit: number, range: TimeRange,
+    source: SessionSource, terms: readonly string[], kinds: readonly string[] | undefined,
+    matchMode: "any" | "phrase", limit: number, range: TimeRange,
   ): CurrentSessionMatch[] {
-    const wanted = new Set(terms);
-    const matches: CurrentSessionMatch[] = [];
-    for (let index = source.entries.length - 1; index >= 0 && matches.length < limit; index--) {
-      const entry = source.entries[index];
+    const candidates: { entry: SessionSource["entries"][number]; score: number }[] = [];
+    for (const entry of source.entries) {
       if (!entry.text.trim()) continue;
+      if (kinds !== undefined && !kinds.includes(entry.role || entry.type)) continue;
       if (range.from !== null && entry.timestamp < range.from) continue;
       if (range.to !== null && entry.timestamp >= range.to) continue;
-      if (!lexicalTerms(entry.text).some(term => wanted.has(term))) continue;
-      matches.push({ entry_id: entry.id, line: entry.line, timestamp: entry.timestamp, kind: entry.role || entry.type });
+      const tokens = lexicalTerms(entry.text);
+      const score = terms.filter(term => tokens.includes(term)).length;
+      if (matchMode === "phrase" ? score < terms.length : score === 0) continue;
+      candidates.push({ entry, score });
     }
-    return matches;
+    candidates.sort((left, right) =>
+      right.score - left.score
+      || left.entry.text.length - right.entry.text.length
+      || right.entry.timestamp.localeCompare(left.entry.timestamp)
+      || right.entry.line - left.entry.line);
+    return candidates.slice(0, limit).map(({ entry }) => ({
+      entry_id: entry.id, line: entry.line, timestamp: entry.timestamp, kind: entry.role || entry.type,
+      snippet: makeSnippet(entry.text, terms),
+    }));
   }
 
   private liveMatches(
-    sessionId: string, terms: readonly string[], limit: number, range: TimeRange,
+    sessionId: string, terms: readonly string[], kinds: readonly string[] | undefined,
+    matchMode: "any" | "phrase", limit: number, range: TimeRange,
   ): CurrentSessionMatch[] {
-    const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
-    return this.db.query<CurrentSessionMatch & { hits: number }, (string | null | number)[]>(`
-      SELECT e.entry_id,e.line,e.timestamp,e.kind,COUNT(*) AS hits
+    const match = matchMode === "phrase"
+      ? `"${terms.join(" ").replaceAll('"', '""')}"`
+      : terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+    const kindClause = kinds === undefined ? "" : ` AND e.kind IN (${kinds.map(() => "?").join(",")})`;
+    return this.db.query<{ entry_id: string; line: number; timestamp: string; kind: string; text: string }, (string | null | number)[]>(`
+      SELECT e.entry_id,e.line,e.timestamp,e.kind,e.text,COUNT(*) AS hits
       FROM hr_live_search f JOIN hr_live_entries e ON e.session_id=f.session_id AND e.row_id=f.row_id
       WHERE hr_live_search MATCH ? AND f.session_id=?
-        AND (? IS NULL OR e.timestamp>=?) AND (? IS NULL OR e.timestamp<?)
-      GROUP BY e.row_id ORDER BY hits DESC,e.line DESC LIMIT ?`)
-      .all(match, sessionId, range.from, range.from, range.to, range.to, limit)
-      .map(({ entry_id, line, timestamp, kind }) => ({ entry_id, line, timestamp, kind }));
+        AND (? IS NULL OR e.timestamp>=?) AND (? IS NULL OR e.timestamp<?)${kindClause}
+      GROUP BY e.row_id ORDER BY hits DESC,length(e.text) ASC,e.line DESC LIMIT ?`)
+      .all(match, sessionId, range.from, range.from, range.to, range.to, ...(kinds ?? []), limit)
+      .map(entry => ({
+        entry_id: entry.entry_id, line: entry.line, timestamp: entry.timestamp, kind: entry.kind,
+        snippet: makeSnippet(entry.text, terms),
+      }));
   }
 
   private async searchCurrentSession(
@@ -253,6 +317,8 @@ export class HistoryStore {
     const file = this.currentSessionFile();
     const terms = lexicalTerms(inputQueries.join(" ")).slice(0, 128);
     if (terms.length === 0) throw new RecallError("invalid_query", "queries contain no searchable terms.");
+    const kinds = normalizeKinds(options.kinds);
+    const matchMode = options.match ?? "any";
     const range = timeRange(options);
     const limit = pageLimit(options.limit);
     const stat = await fs.stat(file);
@@ -263,10 +329,11 @@ export class HistoryStore {
       && (!meta || meta.stamp !== stamp || meta.entry_count <= LIVE_SCAN_MAX_ENTRIES)
       ? "scan" : "index";
     if (strategy === "index" && meta?.stamp === stamp && path.resolve(meta.file) === path.resolve(file)) {
-      const matches = this.liveMatches(this.excludedSessionId, terms, limit, range);
+      const matches = this.liveMatches(this.excludedSessionId, terms, kinds, matchMode, limit, range);
       return {
         mode: "current-session", strategy, session_id: this.excludedSessionId, source_file: meta.file,
         indexed_entries: meta.entry_count, matched_entry_ids: matches.map(match => match.entry_id), matches,
+        snippet_entry_id: matches[0]?.entry_id ?? null, snippet: matches[0]?.snippet ?? null,
         range, pending_files: 0, failures: [], warnings: [], conversations: [], next_cursor: null,
         evidence_required: true,
       };
@@ -278,14 +345,34 @@ export class HistoryStore {
     if (strategy === "scan") this.dropLiveIndex(source.sessionId);
     const indexedEntries = strategy === "scan" ? source.entries.length : this.ensureLiveIndex(source, stamp).indexed_entries;
     const matches = strategy === "scan"
-      ? this.scanCurrentMatches(source, terms, limit, range)
-      : this.liveMatches(source.sessionId, terms, limit, range);
+      ? this.scanCurrentMatches(source, terms, kinds, matchMode, limit, range)
+      : this.liveMatches(source.sessionId, terms, kinds, matchMode, limit, range);
     return {
       mode: "current-session", strategy, session_id: source.sessionId, source_file: source.file,
       indexed_entries: indexedEntries, matched_entry_ids: matches.map(match => match.entry_id), matches,
+      snippet_entry_id: matches[0]?.entry_id ?? null, snippet: matches[0]?.snippet ?? null,
       range, pending_files: 0, failures: [], warnings: [], conversations: [], next_cursor: null,
       evidence_required: true,
     };
+  }
+
+  /** Populate lineage for conversations indexed before hr_links existed. */
+  private async backfillLinks(limit: number, signal?: AbortSignal): Promise<void> {
+    const rows = this.db.query<{ session_id: string; file: string }, [string, number]>(`
+      SELECT c.session_id,c.file FROM hr_conversations c
+      LEFT JOIN hr_links l ON l.session_id=c.session_id
+      WHERE c.scope_id=? AND l.session_id IS NULL LIMIT ?`).all(this.scope.id, limit);
+    for (const row of rows) {
+      signal?.throwIfAborted();
+      try {
+        const header = await readSessionHeader(row.file);
+        this.db.run(`INSERT OR IGNORE INTO hr_links(session_id,parent_session,previous_files,updated_at)
+          VALUES (?,?,?,?)`, [
+          row.session_id, header.parentSession ?? null, JSON.stringify(header.previousSessionFiles),
+          new Date().toISOString(),
+        ]);
+      } catch { /* Missing or unreadable sources are retried on a later pass. */ }
+    }
   }
 
   async sync(options: { maxFiles?: number; maxBytes?: number; signal?: AbortSignal } = {}): Promise<SyncResult> {
@@ -298,6 +385,7 @@ export class HistoryStore {
       throw new RecallError("invalid_budget", "maxBytes must be an integer from 1 to 1073741824.");
     }
     const { files, warnings } = await this.sources(options.signal);
+    await this.backfillLinks(20, options.signal);
     const known = new Map(this.db.query<FileRow, [string]>(
       "SELECT file,stamp,error FROM hr_files WHERE scope_id=?").all(this.scope.id)
       .map(row => [row.file, row]));
@@ -419,6 +507,11 @@ export class HistoryStore {
         ON CONFLICT(scope_id,file) DO UPDATE SET stamp=excluded.stamp,directory=excluded.directory,
           indexed_at=excluded.indexed_at,error=NULL`,
         [this.scope.id, source.file, path.dirname(source.file), source.stamp, now]);
+      this.db.run(`INSERT INTO hr_links(session_id,parent_session,previous_files,updated_at) VALUES (?,?,?,?)
+        ON CONFLICT(session_id) DO UPDATE SET parent_session=excluded.parent_session,
+          previous_files=excluded.previous_files,updated_at=excluded.updated_at`, [
+        source.sessionId, source.parentSession ?? null, JSON.stringify(source.previousSessionFiles), now,
+      ]);
       this.db.run("UPDATE hr_scopes SET revision=revision+1 WHERE scope_id=?", [this.scope.id]);
     }).immediate();
   }
@@ -468,12 +561,17 @@ export class HistoryStore {
     const sync = await this.sync({ maxFiles: 16, signal: options.signal });
     const terms = lexicalTerms(inputQueries.join(" ")).slice(0, 128);
     if (terms.length === 0) throw new RecallError("invalid_query", "queries contain no searchable terms.");
-    const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+    const kinds = normalizeKinds(options.kinds);
+    const matchMode = options.match ?? "any";
+    const match = matchMode === "phrase"
+      ? `"${terms.join(" ").replaceAll('"', '""')}"`
+      : terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
     const range = timeRange(options);
     const limit = pageLimit(options.limit);
+    const generation = this.cursorGeneration(options);
     const binding = digest(JSON.stringify([
-      this.scope.id, this.excludedSessionId, terms, range.from, range.to,
-      options.source_cwd ?? null, options.conversation_id ?? null, options.session_id ?? null, limit, this.revision(),
+      this.scope.id, this.excludedSessionId, terms, kinds ?? null, matchMode, range.from, range.to,
+      options.source_cwd ?? null, options.conversation_id ?? null, options.session_id ?? null, limit, generation,
     ]));
     const offset = options.cursor ? decodeOffsetCursor(options.cursor, binding) : 0;
     const predicate = {
@@ -483,23 +581,33 @@ export class HistoryStore {
         options.source_cwd ?? null, options.source_cwd ?? null, options.conversation_id ?? null, options.conversation_id ?? null,
         options.session_id ?? null, options.session_id ?? null],
     };
+    const kindClause = kinds === undefined ? "" : ` AND e.kind IN (${kinds.map(() => "?").join(",")})`;
+    const kindArgs = kinds ?? [];
     const { rows, conversations } = this.db.transaction(() => {
       const rows = this.db.query(`
-        SELECT c.id,COUNT(*) AS hits FROM hr_search f
+        SELECT c.id,COUNT(*) AS hits,COALESCE(SUM(length(e.text)),0) AS chars
+        FROM hr_search f
         JOIN hr_conversations c ON c.scope_id=f.scope_id AND c.id=f.conversation_id
-        WHERE hr_search MATCH ? AND ${predicate.sql}
-        GROUP BY c.id ORDER BY hits DESC,c.last_active_at DESC,c.id LIMIT ? OFFSET ?`)
-        .all(match, ...predicate.args, limit + 1, offset) as { id: string; hits: number }[];
+        JOIN hr_entries e ON e.scope_id=f.scope_id AND e.id=f.row_id
+        WHERE hr_search MATCH ? AND ${predicate.sql}${kindClause}
+        GROUP BY c.id ORDER BY hits DESC,chars ASC,c.last_active_at DESC,c.id LIMIT ? OFFSET ?`)
+        .all(match, ...predicate.args, ...kindArgs, limit + 1, offset) as { id: string; hits: number }[];
       return {
         rows,
         conversations: rows.slice(0, limit).map(row => {
           const conversation = this.db.query<ConversationRow, [string, string]>(
             "SELECT * FROM hr_conversations WHERE scope_id=? AND id=?").get(this.scope.id, row.id)!;
-          const matched = this.db.query<{ entry_id: string }, [string, string, string]>(`
-            SELECT e.entry_id FROM hr_search f JOIN hr_entries e ON e.scope_id=f.scope_id AND e.id=f.row_id
-            WHERE hr_search MATCH ? AND f.scope_id=? AND f.conversation_id=? ORDER BY e.timestamp,e.line LIMIT 20`)
-            .all(match, this.scope.id, row.id).map(value => value.entry_id);
-          return { ...present(conversation), matched_entry_ids: matched, lexical_hits: row.hits };
+          const matched = this.db.query<{ entry_id: string; text: string }, (string | number)[]>(`
+            SELECT e.entry_id,e.text FROM hr_search f JOIN hr_entries e ON e.scope_id=f.scope_id AND e.id=f.row_id
+            WHERE hr_search MATCH ? AND f.scope_id=? AND f.conversation_id=?${kindClause}
+            ORDER BY length(e.text) ASC,e.timestamp DESC,e.line DESC LIMIT 20`)
+            .all(match, this.scope.id, row.id, ...kindArgs);
+          const matchedIds = matched.map(value => value.entry_id);
+          return {
+            ...present(conversation), matched_entry_ids: matchedIds, lexical_hits: row.hits,
+            snippet_entry_id: matchedIds[0] ?? null,
+            snippet: matched[0] ? makeSnippet(matched[0].text, terms) : null,
+          };
         }),
       };
     })();
@@ -549,6 +657,131 @@ export class HistoryStore {
       ...present(conversation), source_hash: conversation.source_hash,
       ...readSourceEvidence(this.scope.id, source, options),
     };
+  }
+
+  private resolveConversationRow(conversationId?: string, sessionId?: string): ConversationRow | null {
+    if (conversationId !== undefined) {
+      return this.db.query<ConversationRow, [string, string]>(
+        "SELECT * FROM hr_conversations WHERE scope_id=? AND id=?").get(this.scope.id, conversationId) ?? null;
+    }
+    if (sessionId !== undefined) {
+      return this.db.query<ConversationRow, [string, string]>(
+        "SELECT * FROM hr_conversations WHERE scope_id=? AND session_id=?").get(this.scope.id, sessionId) ?? null;
+    }
+    return null;
+  }
+
+  private sessionTraceNode(sessionId: string, relation: SessionTraceNode["relation"], depth: number): SessionTraceNode {
+    const row = this.db.query<{ id: string; title: string }, [string, string]>(
+      "SELECT id,title FROM hr_conversations WHERE scope_id=? AND session_id=?").get(this.scope.id, sessionId);
+    const link = this.db.query<{ parent_session: string | null }, [string]>(
+      "SELECT parent_session FROM hr_links WHERE session_id=?").get(sessionId);
+    return {
+      session_id: sessionId, conversation_id: row?.id ?? null, title: row?.title ?? null,
+      parent_session: link?.parent_session ?? null, relation, depth,
+    };
+  }
+
+  async traceSession(options: { conversation_id?: string; session_id?: string; signal?: AbortSignal } = {}): Promise<SessionTrace> {
+    options.signal?.throwIfAborted();
+    const row = this.resolveConversationRow(options.conversation_id, options.session_id);
+    const sessionId = row?.session_id ?? options.session_id;
+    if (!sessionId) throw new RecallError("invalid_query", "Provide conversation_id or session_id.");
+    const ancestors: SessionTraceNode[] = [];
+    const visited = new Set([sessionId]);
+    let current = sessionId;
+    for (let depth = 1; depth <= 20; depth++) {
+      const parent = this.db.query<{ parent_session: string | null }, [string]>(
+        "SELECT parent_session FROM hr_links WHERE session_id=?").get(current)?.parent_session;
+      if (!parent || visited.has(parent)) break;
+      visited.add(parent);
+      ancestors.push(this.sessionTraceNode(parent, "ancestor", depth));
+      current = parent;
+    }
+    ancestors.reverse();
+    const descendants: SessionTraceNode[] = [];
+    const queue: { id: string; depth: number }[] = [{ id: sessionId, depth: 0 }];
+    while (queue.length > 0 && descendants.length < 100) {
+      const { id, depth } = queue.shift()!;
+      if (depth >= 5) continue;
+      for (const child of this.db.query<{ session_id: string }, [string]>(
+        "SELECT session_id FROM hr_links WHERE parent_session=? ORDER BY session_id").all(id)) {
+        if (visited.has(child.session_id)) continue;
+        visited.add(child.session_id);
+        descendants.push(this.sessionTraceNode(child.session_id, "descendant", depth + 1));
+        queue.push({ id: child.session_id, depth: depth + 1 });
+      }
+    }
+    return {
+      mode: "session-trace", session_id: sessionId, ancestors, descendants,
+      truncated: ancestors.length >= 20 || descendants.length >= 100,
+    };
+  }
+
+  async traceEvent(options: {
+    conversation_id?: string; session_id?: string; entry_id: string; signal?: AbortSignal;
+  }): Promise<EventTrace> {
+    options.signal?.throwIfAborted();
+    if (!options.entry_id) throw new RecallError("invalid_query", "entry_id is required for an event trace.");
+    const row = this.resolveConversationRow(options.conversation_id, options.session_id);
+    let source: SessionSource;
+    if (options.session_id !== undefined && options.session_id === this.excludedSessionId) {
+      source = await loadSource(this.currentSessionFile(), { signal: options.signal });
+      if (source.sessionId !== this.excludedSessionId) {
+        throw new RecallError("stale_evidence", "The current session file no longer matches the active session.");
+      }
+    } else {
+      if (!row) throw new RecallError("not_found", "Conversation is unavailable.");
+      const { files } = await this.sources(options.signal);
+      await validateSourceFile(row.file, files, options.signal);
+      source = await loadSource(row.file, { signal: options.signal });
+      if (source.sessionId !== row.session_id || source.fingerprint !== row.source_hash) {
+        throw new RecallError("stale_evidence", "Conversation changed after indexing; run sync before tracing.");
+      }
+    }
+    const byId = new Map(source.entries.map(entry => [entry.id, entry]));
+    const target = byId.get(options.entry_id);
+    if (!target) throw new RecallError("not_found", "Entry does not belong to this conversation revision.");
+    const node = (entry: SessionSource["entries"][number]): EventTraceNode => ({
+      entry_id: entry.id, timestamp: entry.timestamp, kind: entry.role || entry.type, line: entry.line,
+    });
+    const ancestors: EventTraceNode[] = [];
+    for (let current = target.parentId ? byId.get(target.parentId) : undefined; current; current = current.parentId ? byId.get(current.parentId) : undefined) {
+      ancestors.unshift(node(current));
+      if (ancestors.length >= 100) break;
+    }
+    const children = source.entries.filter(entry => entry.parentId === target.id)
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp) || left.line - right.line)
+      .slice(0, 100).map(node);
+    const alternateBranches = source.entries
+      .filter(entry => entry.parentId === target.parentId && entry.id !== target.id)
+      .sort((left, right) => left.timestamp.localeCompare(right.timestamp) || left.line - right.line)
+      .slice(0, 50).map(entry => entry.id);
+    return {
+      mode: "event-trace", conversation_id: row?.id ?? null, session_id: source.sessionId,
+      target: node(target), ancestors, children, alternate_branches: alternateBranches,
+      truncated: ancestors.length >= 100 || children.length >= 100,
+    };
+  }
+
+  private cursorGeneration(options: SearchOptions): string {
+    const row = options.conversation_id !== undefined
+      ? this.db.query<{ source_hash: string; indexed_at: string }, [string, string]>(
+        "SELECT source_hash,indexed_at FROM hr_conversations WHERE scope_id=? AND id=?")
+        .get(this.scope.id, options.conversation_id)
+      : options.session_id !== undefined
+        ? this.db.query<{ source_hash: string; indexed_at: string }, [string, string]>(
+          "SELECT source_hash,indexed_at FROM hr_conversations WHERE scope_id=? AND session_id=?")
+          .get(this.scope.id, options.session_id)
+        : undefined;
+    if (row) return `${row.source_hash}:${row.indexed_at}`;
+    if (options.source_cwd !== undefined) {
+      const rows = this.db.query<{ id: string; source_hash: string; indexed_at: string }, [string, string]>(
+        "SELECT id,source_hash,indexed_at FROM hr_conversations WHERE scope_id=? AND source_cwd=? ORDER BY id")
+        .all(this.scope.id, options.source_cwd);
+      return digest(JSON.stringify(rows));
+    }
+    return `scope:${this.revision()}`;
   }
 
   revision(): number {

@@ -63,6 +63,7 @@ it("searches and reads historical sessions through real OMP tools without extra 
     { name: "history_recall_read_conversation", args: { conversation_id: "" } },
     { name: "history_recall_search", args: { queries: ["fsync"], session_id: "" } },
     { name: "history_recall_read_conversation", args: { session_id: "", last: 2 } },
+    { name: "history_recall_trace", args: { session_id: "" } },
   ];
   let step = 0;
   let conversationId = "";
@@ -73,7 +74,7 @@ it("searches and reads historical sessions through real OMP tools without extra 
       requests.push(body as typeof requestSchema);
       const call = calls[step++];
       if (!call) return streamReply({ role: "assistant", content: "Protocol fixture complete." });
-      if (call.name === "history_recall_search" && call.args.session_id === "") {
+      if ((call.name === "history_recall_search" || call.name === "history_recall_trace") && call.args.session_id === "") {
         call.args.session_id = manager.getSessionId();
       }
       if (call.name === "history_recall_read_conversation") {
@@ -131,16 +132,17 @@ it("searches and reads historical sessions through real OMP tools without extra 
   expect(conversationId).not.toBe("");
 
   expect(errors).toEqual([]);
-  // Four tool calls plus the final answer; no indexing/search model calls.
-  expect(requests).toHaveLength(5);
+  // Five tool calls plus the final answer; no indexing/search model calls.
+  expect(requests).toHaveLength(6);
   const sessionFile = manager.getSessionFile();
   expect(sessionFile).toBeDefined();
   const persisted = await loadSource(sessionFile!);
   const toolResults = persisted.entries.filter(entry => entry.role === "toolResult");
-  expect(toolResults).toHaveLength(4);
+  expect(toolResults).toHaveLength(5);
   const outputs = JSON.stringify(toolResults);
   expect(outputs).toContain("past-session");
   expect(outputs).toContain("current-session");
+  expect(outputs).toContain("session-trace");
   expect(outputs).toContain("WAL fsync failed");
   expect(outputs).not.toContain('"isError":true');
   const system = JSON.stringify(requests[0].messages[0]);

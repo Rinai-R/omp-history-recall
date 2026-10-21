@@ -1,6 +1,6 @@
 {
   "name": "omp-history-recall",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Local full-text search over Oh My Pi session history",
   "repository": {
     "type": "git",

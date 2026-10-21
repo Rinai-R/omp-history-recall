@@ -29,10 +29,16 @@ function record(type: string, id: string, parentId: string | null, extra: Record
   return { type, id, parentId, timestamp: "2026-09-20T01:00:00Z", ...extra };
 }
 
-async function writeSession(directory: string, name: string, sessionId: string, cwd: string, records: unknown[]) {
+async function writeSession(
+  directory: string, name: string, sessionId: string, cwd: string, records: unknown[],
+  headerExtra: Record<string, unknown> = {},
+) {
   await fs.mkdir(directory, { recursive: true });
   const file = path.join(directory, `${name}.jsonl`);
-  const header = { type: "session", version: 3, id: sessionId, cwd, timestamp: "2026-09-20T00:00:00Z", title: name };
+  const header = {
+    type: "session", version: 3, id: sessionId, cwd, timestamp: "2026-09-20T00:00:00Z", title: name,
+    ...headerExtra,
+  };
   await fs.writeFile(file, [header, ...records].map(record => JSON.stringify(record)).join("\n") + "\n");
   return file;
 }
@@ -249,7 +255,7 @@ describe("FTS session index", () => {
     const { store } = await setupLive(chain(20, index => `sandbox note ${index}`));
     const result = await store.search(["sandbox"], { session_id: "live-session" });
     expect(result).toMatchObject({ mode: "current-session", strategy: "scan" });
-    expect(result.matches?.[0]).toMatchObject({ entry_id: "e19", kind: "assistant" });
+    expect(result.matches?.[0]).toMatchObject({ entry_id: "e9", kind: "assistant" });
     expect(store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM hr_live_files").get()!.n).toBe(0);
   });
 
@@ -309,6 +315,99 @@ describe("FTS session index", () => {
       "SELECT id FROM hr_conversations WHERE session_id=?").get("a")!.id;
     const page = await store.readConversation(conversationId, { last: 2 });
     expect(page.fragments.map(fragment => fragment.entry_id)).toEqual(["a2", "a3"]);
+  });
+
+  it("returns a snippet for the best matching entry and filters by kind", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    const records = [
+      ...conversation("a"),
+      record("compaction", "a-c", "a-a", { summary: "sandbox marker in a summary", firstKeptEntryId: "a-u" }),
+    ];
+    await writeSession(path.join(sessionsRoot, "bucket-a"), "a", "a", root, records);
+    await store.sync();
+    const hit = (await store.search(["sandbox"])).conversations[0];
+    expect(hit.snippet).toContain("sandbox marker");
+    expect(hit.snippet_entry_id).toBe("a-c");
+    const compacted = (await store.search(["marker"], { kinds: ["compaction"] })).conversations[0];
+    expect(compacted.matched_entry_ids).toEqual(["a-c"]);
+    expect((await store.search(["fsync"], { kinds: ["compaction"] })).conversations).toHaveLength(0);
+  });
+
+  it("ranks by hit count, then document length, with stable ties", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    await writeSession(path.join(sessionsRoot, "bucket-a"), "dense", "dense", root,
+      chain(3, index => `rankingtoken ${index}`, "d"));
+    await writeSession(path.join(sessionsRoot, "bucket-b"), "sparse", "sparse", root,
+      chain(1, () => "rankingtoken", "s"));
+    await writeSession(path.join(sessionsRoot, "bucket-c"), "short", "short", root,
+      [record("message", "short-u", null, { message: { role: "user", content: "rankingtoken" } })]);
+    await writeSession(path.join(sessionsRoot, "bucket-d"), "long", "long", root,
+      [record("message", "long-u", null, { message: { role: "user", content: `rankingtoken ${"x".repeat(400)}` } })]);
+    await store.sync({ maxFiles: 20 });
+    const result = await store.search(["rankingtoken"], { limit: 10 });
+    expect(result.conversations.map(hit => hit.session_id)).toEqual(["dense", "short", "sparse", "long"]);
+  });
+
+  it("supports literal phrase matching", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    await writeSession(path.join(sessionsRoot, "bucket-a"), "phrase", "phrase", root, [
+      record("message", "p1", null, { message: { role: "user", content: "alpha beta" } }),
+      record("message", "p2", "p1", { message: { role: "assistant", content: "alpha and beta separated" } }),
+    ]);
+    await store.sync();
+    const phrase = await store.search(["alpha beta"], { match: "phrase" });
+    expect(phrase.conversations[0].matched_entry_ids).toEqual(["p1"]);
+    const any = await store.search(["alpha beta"]);
+    expect(any.conversations[0].matched_entry_ids.sort()).toEqual(["p1", "p2"]);
+  });
+
+  it("keeps workspace cursors valid when unrelated working directories change", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    const shared = path.join(root, "shared");
+    const other = path.join(root, "other");
+    for (let index = 0; index < 3; index++) {
+      await writeSession(path.join(sessionsRoot, "bucket-shared"), `s${index}`, `s${index}`, shared,
+        chain(1, () => "cursor token", `s${index}-`));
+    }
+    await writeSession(path.join(sessionsRoot, "bucket-other"), "o0", "o0", other, chain(1, () => "cursor token", "o0-"));
+    await store.sync({ maxFiles: 10 });
+    const first = await store.search(["cursor"], { source_cwd: shared, limit: 1 });
+    expect(first.next_cursor).not.toBeNull();
+
+    await writeSession(path.join(sessionsRoot, "bucket-other"), "o1", "o1", other, chain(1, () => "cursor token", "o1-"));
+    await store.sync({ maxFiles: 10 });
+    const resumed = await store.search(["cursor"], { source_cwd: shared, limit: 1, cursor: first.next_cursor! });
+    expect(resumed.conversations).toHaveLength(1);
+
+    await writeSession(path.join(sessionsRoot, "bucket-shared"), "s3", "s3", shared, chain(1, () => "cursor token", "s3-"));
+    await store.sync({ maxFiles: 10 });
+    await expect(store.search(["cursor"], { source_cwd: shared, limit: 1, cursor: first.next_cursor! }))
+      .rejects.toMatchObject({ code: "stale_cursor" });
+  });
+
+  it("traces session lineage and entry branches", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    await writeSession(path.join(sessionsRoot, "bucket-a"), "parent", "parent", root, chain(1, () => "parent work", "p"));
+    await writeSession(path.join(sessionsRoot, "bucket-b"), "child", "child", root, [
+      record("message", "root", null, { message: { role: "user", content: "root" } }),
+      record("message", "branch-a", "root", { message: { role: "assistant", content: "branch a" } }),
+      record("message", "branch-b", "root", { message: { role: "assistant", content: "branch b" } }),
+    ], { parentSession: "parent" });
+    await store.sync({ maxFiles: 10 });
+
+    const child = await store.traceSession({ session_id: "child" });
+    expect(child.ancestors).toMatchObject([{ session_id: "parent", relation: "ancestor" }]);
+    const parent = await store.traceSession({ session_id: "parent" });
+    expect(parent.descendants).toMatchObject([{ session_id: "child", relation: "descendant" }]);
+
+    const event = await store.traceEvent({ session_id: "child", entry_id: "branch-a" });
+    expect(event.ancestors.map(node => node.entry_id)).toEqual(["root"]);
+    expect(event.alternate_branches).toEqual(["branch-b"]);
+    expect(event.children).toEqual([]);
+
+    store.db.run("DELETE FROM hr_links");
+    await store.sync();
+    expect(store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM hr_links").get()!.n).toBe(2);
   });
 
   it("rejects incompatible derived databases with a rebuild instruction", async () => {

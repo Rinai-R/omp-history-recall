@@ -46,6 +46,11 @@ const LIVE_SCHEMA = `
     PRIMARY KEY(session_id,row_id)
   );
   CREATE VIRTUAL TABLE IF NOT EXISTS hr_live_search USING fts5(row_id UNINDEXED,session_id UNINDEXED,body);
+  CREATE TABLE IF NOT EXISTS hr_links (
+    session_id TEXT NOT NULL PRIMARY KEY,parent_session TEXT NULL,
+    previous_files TEXT NOT NULL,updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS hr_links_parent ON hr_links(parent_session);
 `;
 
 export function openHistoryDatabase(file: string): Database {

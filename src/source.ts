@@ -41,6 +41,8 @@ export type SessionSource = {
   title: string;
   timestamp: string;
   fingerprint: string;
+  parentSession?: string;
+  previousSessionFiles: string[];
   entries: SourceEntry[];
 };
 
@@ -231,8 +233,38 @@ export async function loadSource(
   return {
     sessionId: header.id, cwd, file: resolved, sizeBytes: stat.size, stamp: `${stat.mtimeMs}:${stat.size}`,
     title: redact(title ?? (typeof header.title === "string" ? header.title : "Untitled session")),
-    timestamp: timestamp(header.timestamp), fingerprint: fileHash.digest("hex"), entries,
+    timestamp: timestamp(header.timestamp), fingerprint: fileHash.digest("hex"),
+    parentSession: typeof header.parentSession === "string" && header.parentSession ? header.parentSession : undefined,
+    previousSessionFiles: Array.isArray(header.previousSessionFiles)
+      ? header.previousSessionFiles.filter((value): value is string => typeof value === "string" && path.isAbsolute(value))
+      : [],
+    entries,
   };
+}
+
+/** Read only the session header, for lineage backfill of already-indexed files. */
+export async function readSessionHeader(file: string): Promise<{
+  parentSession?: string; previousSessionFiles: string[];
+}> {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(65_536);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+    for (const line of buffer.subarray(0, bytesRead).toString("utf8").split("\n")) {
+      let record: Record<string, unknown> | undefined;
+      try { record = object(JSON.parse(line)); } catch { continue; }
+      if (record?.type !== "session") continue;
+      return {
+        parentSession: typeof record.parentSession === "string" && record.parentSession ? record.parentSession : undefined,
+        previousSessionFiles: Array.isArray(record.previousSessionFiles)
+          ? record.previousSessionFiles.filter((value): value is string => typeof value === "string" && path.isAbsolute(value))
+          : [],
+      };
+    }
+    return { previousSessionFiles: [] };
+  } finally {
+    await handle.close();
+  }
 }
 
 
