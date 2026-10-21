@@ -38,7 +38,7 @@ omp install omp-history-recall
 /history-recall status
 ```
 
-Agent 可以使用 `history_recall_search`、`history_recall_conversations` 和 `history_recall_read_conversation`。搜索覆盖当前 profile；传入 `source_cwd` 可限定到某个工作目录，命中结果通过 `next_cursor` 翻页。
+Agent 可以使用 `history_recall_search`、`history_recall_conversations` 和 `history_recall_read_conversation`。搜索覆盖当前 profile；传入 `source_cwd` 可限定到某个工作目录，命中结果通过 `next_cursor` 翻页。传入 `session_id` 可只针对某个会话；当前会话直接读取，文件较大时才建立本地索引。`last=N` 返回会话最新 N 条。
 
 可选环境变量：`OMP_HISTORY_RECALL_DB`（索引路径）、`OMP_HISTORY_RECALL_INGEST_FILES`（默认 64）、`OMP_HISTORY_RECALL_INGEST_BYTES`（默认 32 MiB）、`OMP_HISTORY_RECALL_DISABLED=1`。
 

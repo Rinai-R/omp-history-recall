@@ -1,7 +1,8 @@
 import type { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { digest, loadSource, readSourceEvidence, RecallError, type SessionSource } from "./source";
+import { digest, lexicalTerms, loadSource, readSourceEvidence, RecallError, type SessionSource } from "./source";
 import { timeRange, type TimeFilter, type TimeRange } from "./time";
 import { openHistoryDatabase } from "./database";
 import {
@@ -16,6 +17,24 @@ type ConversationRow = {
   size_bytes: number;
 };
 type FileRow = { file: string; stamp: string; error: string | null };
+type LiveMeta = {
+  session_id: string; file: string; stamp: string;
+  indexed_size: number; indexed_lines: number; entry_count: number; updated_at: string;
+};
+
+const LIVE_INDEX_DEFAULT_BYTES = 4 * 1024 * 1024;
+const LIVE_SCAN_MAX_ENTRIES = 20_000;
+const LIVE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+
+function liveIndexBytes(): number {
+  const raw = process.env.OMP_HISTORY_RECALL_LIVE_INDEX_BYTES;
+  if (raw === undefined) return LIVE_INDEX_DEFAULT_BYTES;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 65_536 || value > 128 * 1024 * 1024) {
+    throw new RecallError("invalid_budget", "OMP_HISTORY_RECALL_LIVE_INDEX_BYTES must be an integer from 65536 to 134217728.");
+  }
+  return value;
+}
 
 export type CatalogEntry = SourceFileInfo & {
   indexed: boolean; conversation_id: string | null; session_id: string | null;
@@ -31,8 +50,10 @@ export type SyncResult = {
   warnings: SourceWarning[]; failures: SyncFailure[];
 };
 export type SearchOptions = TimeFilter & {
-  source_cwd?: string; conversation_id?: string; limit?: number; cursor?: string; signal?: AbortSignal;
+  source_cwd?: string; conversation_id?: string; session_id?: string;
+  limit?: number; cursor?: string; signal?: AbortSignal;
 };
+export type CurrentSessionMatch = { entry_id: string; line: number; timestamp: string; kind: string };
 export type PresentedConversation = {
   id: string; session_id: string; title: string; description: string;
   started_at: string; last_active_at: string; entry_count: number; message_count: number;
@@ -41,21 +62,17 @@ export type PresentedConversation = {
 };
 export type SearchHit = PresentedConversation & { matched_entry_ids: string[]; lexical_hits: number };
 export type SearchResult = {
-  mode: "lexical"; range: TimeRange; pending_files: number; failures: SyncFailure[];
+  mode: "lexical" | "current-session";
+  range: TimeRange; pending_files: number; failures: SyncFailure[];
   warnings: SourceWarning[]; evidence_required: true;
   conversations: SearchHit[]; next_cursor: string | null;
+  strategy?: "scan" | "index";
+  session_id?: string;
+  source_file?: string;
+  indexed_entries?: number;
+  matched_entry_ids?: string[];
+  matches?: CurrentSessionMatch[];
 };
-
-/** Characters that can form FTS tokens; Han text is indexed as overlapping bigrams. */
-function searchTerms(text: string): string[] {
-  const normalized = text.normalize("NFKC").toLowerCase();
-  const values = [...normalized.matchAll(/[a-z0-9_]+|\p{Script=Han}+/gu)].flatMap(match => {
-    const word = match[0];
-    if (!/\p{Script=Han}/u.test(word)) return word.length > 1 ? [word] : [];
-    return word.length < 2 ? [word] : Array.from({ length: word.length - 1 }, (_, index) => word.slice(index, index + 2));
-  });
-  return [...new Set(values)];
-}
 
 function pageLimit(value = 10): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > 50) throw new RecallError("invalid_limit", "limit must be between 1 and 50.");
@@ -105,6 +122,7 @@ export class HistoryStore {
     this.excludedSessionId = access.activeSessionId;
     this.db = openHistoryDatabase(dbPath);
     this.db.run("INSERT OR IGNORE INTO hr_scopes(scope_id,revision) VALUES (?,0)", [scope.id]);
+    this.pruneLiveIndexes();
   }
 
   setSourceAccess(access: SourceAccess): void {
@@ -128,6 +146,146 @@ export class HistoryStore {
 
   private async sources(signal?: AbortSignal) {
     return enumerateSources(this.scope, this.access, this.knownFiles(), signal);
+  }
+
+  private currentSessionFile(): string {
+    if (!this.access.activeFile) throw new RecallError("not_found", "The current session is not file-backed.");
+    return this.access.activeFile;
+  }
+
+  /** Drop live indexes whose session ended long ago or whose file disappeared. */
+  private pruneLiveIndexes(): void {
+    const cutoff = new Date(Date.now() - LIVE_RETENTION_MS).toISOString();
+    const rows = this.db.query<LiveMeta, []>("SELECT * FROM hr_live_files").all();
+    for (const row of rows) {
+      if (row.updated_at >= cutoff && existsSync(row.file)) continue;
+      this.db.transaction(() => {
+        this.db.run("DELETE FROM hr_live_search WHERE session_id=?", [row.session_id]);
+        this.db.run("DELETE FROM hr_live_entries WHERE session_id=?", [row.session_id]);
+        this.db.run("DELETE FROM hr_live_files WHERE session_id=?", [row.session_id]);
+      })();
+    }
+  }
+
+  private writeLiveMeta(sessionId: string, source: SessionSource, stamp: string, indexedLines: number, entryCount: number): void {
+    this.db.run(`INSERT INTO hr_live_files(session_id,file,stamp,indexed_size,indexed_lines,entry_count,updated_at)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+      file=excluded.file,stamp=excluded.stamp,indexed_size=excluded.indexed_size,
+      indexed_lines=excluded.indexed_lines,entry_count=excluded.entry_count,updated_at=excluded.updated_at`, [
+      sessionId, source.file, stamp, source.sizeBytes, indexedLines, entryCount, new Date().toISOString(),
+    ]);
+  }
+
+  /** Ensure the current session's shadow FTS index matches the file, touching only new rows. */
+  private ensureLiveIndex(source: SessionSource, stamp: string): { indexed_entries: number; indexed_lines: number } {
+    const sessionId = source.sessionId;
+    const meta = this.db.query<LiveMeta, [string]>("SELECT * FROM hr_live_files WHERE session_id=?").get(sessionId);
+    if (meta && meta.stamp === stamp) {
+      return { indexed_entries: meta.entry_count, indexed_lines: meta.indexed_lines };
+    }
+    const maxLine = source.entries.at(-1)?.line ?? 0;
+    const rebuild = !meta || source.sizeBytes < meta.indexed_size
+      || source.sizeBytes === meta.indexed_size
+      || source.entries.length <= meta.entry_count;
+    const insert = this.db.transaction(() => {
+      const insertEntry = this.db.prepare(`INSERT INTO hr_live_entries(session_id,row_id,entry_id,line,timestamp,kind,hash,text)
+        VALUES (?,?,?,?,?,?,?,?)`);
+      const insertSearch = this.db.prepare("INSERT INTO hr_live_search(row_id,session_id,body) VALUES (?,?,?)");
+      const entries = rebuild ? source.entries : source.entries.filter(entry => entry.line > meta.indexed_lines);
+      if (rebuild) {
+        this.db.run("DELETE FROM hr_live_search WHERE session_id=?", [sessionId]);
+        this.db.run("DELETE FROM hr_live_entries WHERE session_id=?", [sessionId]);
+      }
+      for (const entry of entries) {
+        const rowId = `l_${digest(JSON.stringify([sessionId, entry.id])).slice(0, 24)}`;
+        insertEntry.run(sessionId, rowId, entry.id, entry.line, entry.timestamp,
+          entry.role || entry.type, entry.hash, entry.text);
+        if (entry.text.trim()) insertSearch.run(rowId, sessionId, lexicalTerms(entry.text).join(" "));
+      }
+      this.writeLiveMeta(sessionId, source, stamp, Math.max(meta?.indexed_lines ?? 0, maxLine), source.entries.length);
+    });
+    insert.immediate();
+    return { indexed_entries: source.entries.length, indexed_lines: Math.max(meta?.indexed_lines ?? 0, maxLine) };
+  }
+
+  private dropLiveIndex(sessionId: string): void {
+    if (!this.db.query("SELECT 1 FROM hr_live_files WHERE session_id=?").get(sessionId)) return;
+    this.db.transaction(() => {
+      this.db.run("DELETE FROM hr_live_search WHERE session_id=?", [sessionId]);
+      this.db.run("DELETE FROM hr_live_entries WHERE session_id=?", [sessionId]);
+      this.db.run("DELETE FROM hr_live_files WHERE session_id=?", [sessionId]);
+    })();
+  }
+
+  private scanCurrentMatches(
+    source: SessionSource, terms: readonly string[], limit: number, range: TimeRange,
+  ): CurrentSessionMatch[] {
+    const wanted = new Set(terms);
+    const matches: CurrentSessionMatch[] = [];
+    for (let index = source.entries.length - 1; index >= 0 && matches.length < limit; index--) {
+      const entry = source.entries[index];
+      if (!entry.text.trim()) continue;
+      if (range.from !== null && entry.timestamp < range.from) continue;
+      if (range.to !== null && entry.timestamp >= range.to) continue;
+      if (!lexicalTerms(entry.text).some(term => wanted.has(term))) continue;
+      matches.push({ entry_id: entry.id, line: entry.line, timestamp: entry.timestamp, kind: entry.role || entry.type });
+    }
+    return matches;
+  }
+
+  private liveMatches(
+    sessionId: string, terms: readonly string[], limit: number, range: TimeRange,
+  ): CurrentSessionMatch[] {
+    const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+    return this.db.query<CurrentSessionMatch & { hits: number }, (string | null | number)[]>(`
+      SELECT e.entry_id,e.line,e.timestamp,e.kind,COUNT(*) AS hits
+      FROM hr_live_search f JOIN hr_live_entries e ON e.session_id=f.session_id AND e.row_id=f.row_id
+      WHERE hr_live_search MATCH ? AND f.session_id=?
+        AND (? IS NULL OR e.timestamp>=?) AND (? IS NULL OR e.timestamp<?)
+      GROUP BY e.row_id ORDER BY hits DESC,e.line DESC LIMIT ?`)
+      .all(match, sessionId, range.from, range.from, range.to, range.to, limit)
+      .map(({ entry_id, line, timestamp, kind }) => ({ entry_id, line, timestamp, kind }));
+  }
+
+  private async searchCurrentSession(
+    inputQueries: readonly string[], options: SearchOptions,
+  ): Promise<SearchResult> {
+    const file = this.currentSessionFile();
+    const terms = lexicalTerms(inputQueries.join(" ")).slice(0, 128);
+    if (terms.length === 0) throw new RecallError("invalid_query", "queries contain no searchable terms.");
+    const range = timeRange(options);
+    const limit = pageLimit(options.limit);
+    const stat = await fs.stat(file);
+    const stamp = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    const meta = this.db.query<LiveMeta, [string]>("SELECT * FROM hr_live_files WHERE session_id=?")
+      .get(this.excludedSessionId);
+    const strategy = stat.size <= liveIndexBytes()
+      && (!meta || meta.stamp !== stamp || meta.entry_count <= LIVE_SCAN_MAX_ENTRIES)
+      ? "scan" : "index";
+    if (strategy === "index" && meta?.stamp === stamp && path.resolve(meta.file) === path.resolve(file)) {
+      const matches = this.liveMatches(this.excludedSessionId, terms, limit, range);
+      return {
+        mode: "current-session", strategy, session_id: this.excludedSessionId, source_file: meta.file,
+        indexed_entries: meta.entry_count, matched_entry_ids: matches.map(match => match.entry_id), matches,
+        range, pending_files: 0, failures: [], warnings: [], conversations: [], next_cursor: null,
+        evidence_required: true,
+      };
+    }
+    const source = await loadSource(file, { signal: options.signal });
+    if (source.sessionId !== this.excludedSessionId) {
+      throw new RecallError("stale_evidence", "The current session file no longer matches the active session.");
+    }
+    if (strategy === "scan") this.dropLiveIndex(source.sessionId);
+    const indexedEntries = strategy === "scan" ? source.entries.length : this.ensureLiveIndex(source, stamp).indexed_entries;
+    const matches = strategy === "scan"
+      ? this.scanCurrentMatches(source, terms, limit, range)
+      : this.liveMatches(source.sessionId, terms, limit, range);
+    return {
+      mode: "current-session", strategy, session_id: source.sessionId, source_file: source.file,
+      indexed_entries: indexedEntries, matched_entry_ids: matches.map(match => match.entry_id), matches,
+      range, pending_files: 0, failures: [], warnings: [], conversations: [], next_cursor: null,
+      evidence_required: true,
+    };
   }
 
   async sync(options: { maxFiles?: number; maxBytes?: number; signal?: AbortSignal } = {}): Promise<SyncResult> {
@@ -254,7 +412,7 @@ export class HistoryStore {
           const rowId = `e_${digest(JSON.stringify([this.scope.id, source.sessionId, entry.id])).slice(0, 24)}`;
           insertEntry.run(this.scope.id, rowId, id, entry.id, entry.parentId, entry.timestamp,
             entry.role || entry.type, entry.line, entry.hash, entry.text);
-          if (entry.text.trim()) insertSearch.run(rowId, this.scope.id, id, searchTerms(entry.text).join(" "));
+          if (entry.text.trim()) insertSearch.run(rowId, this.scope.id, id, lexicalTerms(entry.text).join(" "));
         }
       }
       this.db.run(`INSERT INTO hr_files(scope_id,file,directory,stamp,indexed_at,error) VALUES (?,?,?,?,?,NULL)
@@ -304,22 +462,26 @@ export class HistoryStore {
       throw new RecallError("invalid_query", "each query must contain 1 to 2000 characters.");
     }
     options.signal?.throwIfAborted();
+    if (options.session_id !== undefined && options.session_id === this.excludedSessionId) {
+      return this.searchCurrentSession(inputQueries, options);
+    }
     const sync = await this.sync({ maxFiles: 16, signal: options.signal });
-    const terms = searchTerms(inputQueries.join(" ")).slice(0, 128);
+    const terms = lexicalTerms(inputQueries.join(" ")).slice(0, 128);
     if (terms.length === 0) throw new RecallError("invalid_query", "queries contain no searchable terms.");
     const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
     const range = timeRange(options);
     const limit = pageLimit(options.limit);
     const binding = digest(JSON.stringify([
       this.scope.id, this.excludedSessionId, terms, range.from, range.to,
-      options.source_cwd ?? null, options.conversation_id ?? null, limit, this.revision(),
+      options.source_cwd ?? null, options.conversation_id ?? null, options.session_id ?? null, limit, this.revision(),
     ]));
     const offset = options.cursor ? decodeOffsetCursor(options.cursor, binding) : 0;
     const predicate = {
       sql: `c.scope_id=? AND c.session_id<>? AND (? IS NULL OR c.last_active_at>=?) AND (? IS NULL OR c.started_at<?)
-        AND (? IS NULL OR c.source_cwd=?) AND (? IS NULL OR c.id=?)`,
+        AND (? IS NULL OR c.source_cwd=?) AND (? IS NULL OR c.id=?) AND (? IS NULL OR c.session_id=?)`,
       args: [this.scope.id, this.excludedSessionId, range.from, range.from, range.to, range.to,
-        options.source_cwd ?? null, options.source_cwd ?? null, options.conversation_id ?? null, options.conversation_id ?? null],
+        options.source_cwd ?? null, options.source_cwd ?? null, options.conversation_id ?? null, options.conversation_id ?? null,
+        options.session_id ?? null, options.session_id ?? null],
     };
     const { rows, conversations } = this.db.transaction(() => {
       const rows = this.db.query(`
@@ -349,12 +511,33 @@ export class HistoryStore {
     };
   }
 
-  async readConversation(conversationId: string, options: {
-    cursor?: string; maxChars?: number; entry_id?: string; before?: number; after?: number; signal?: AbortSignal;
+  async readConversation(conversationId: string | undefined, options: {
+    session_id?: string; cursor?: string; maxChars?: number; entry_id?: string;
+    before?: number; after?: number; last?: number; signal?: AbortSignal;
   } = {}) {
-    const conversation = this.db.query<ConversationRow, [string, string, string]>(
-      "SELECT * FROM hr_conversations WHERE scope_id=? AND id=? AND session_id<>?")
-      .get(this.scope.id, conversationId, this.excludedSessionId);
+    if (options.session_id !== undefined && options.session_id === this.excludedSessionId) {
+      const source = await loadSource(this.currentSessionFile(), { signal: options.signal });
+      if (source.sessionId !== this.excludedSessionId) {
+        throw new RecallError("stale_evidence", "The current session file no longer matches the active session.");
+      }
+      return {
+        ...readSourceEvidence(`current_${source.sessionId}`, source, options),
+        mode: "current-session", id: null, session_id: source.sessionId, title: source.title,
+        source_cwd: source.cwd, source_hash: source.fingerprint, entry_count: source.entries.length,
+      };
+    }
+    let conversation: ConversationRow | null = null;
+    if (conversationId !== undefined) {
+      conversation = this.db.query<ConversationRow, [string, string, string]>(
+        "SELECT * FROM hr_conversations WHERE scope_id=? AND id=? AND session_id<>?")
+        .get(this.scope.id, conversationId, this.excludedSessionId);
+    } else if (options.session_id !== undefined) {
+      conversation = this.db.query<ConversationRow, [string, string, string]>(
+        "SELECT * FROM hr_conversations WHERE scope_id=? AND session_id=? AND session_id<>?")
+        .get(this.scope.id, options.session_id, this.excludedSessionId);
+    } else {
+      throw new RecallError("invalid_query", "Provide conversation_id or session_id.");
+    }
     if (!conversation) throw new RecallError("not_found", "Conversation is unavailable or belongs to the active session.");
     const { files } = await this.sources(options.signal);
     await validateSourceFile(conversation.file, files, options.signal);

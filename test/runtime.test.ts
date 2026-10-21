@@ -61,6 +61,8 @@ it("searches and reads historical sessions through real OMP tools without extra 
   const calls: { name: string; args: Record<string, unknown> }[] = [
     { name: "history_recall_search", args: { queries: ["fsync"] } },
     { name: "history_recall_read_conversation", args: { conversation_id: "" } },
+    { name: "history_recall_search", args: { queries: ["fsync"], session_id: "" } },
+    { name: "history_recall_read_conversation", args: { session_id: "", last: 2 } },
   ];
   let step = 0;
   let conversationId = "";
@@ -71,11 +73,18 @@ it("searches and reads historical sessions through real OMP tools without extra 
       requests.push(body as typeof requestSchema);
       const call = calls[step++];
       if (!call) return streamReply({ role: "assistant", content: "Protocol fixture complete." });
+      if (call.name === "history_recall_search" && call.args.session_id === "") {
+        call.args.session_id = manager.getSessionId();
+      }
       if (call.name === "history_recall_read_conversation") {
-        if (!conversationId) {
-          conversationId = probe.query<{ id: string }, []>("SELECT id FROM hr_conversations").get()?.id ?? "";
+        if (call.args.session_id === "") {
+          call.args.session_id = manager.getSessionId();
+        } else {
+          if (!conversationId) {
+            conversationId = probe.query<{ id: string }, []>("SELECT id FROM hr_conversations").get()?.id ?? "";
+          }
+          call.args.conversation_id = conversationId;
         }
-        call.args.conversation_id = conversationId;
       }
       return streamReply({ role: "assistant", tool_calls: [{ index: 0, id: `recall${requests.length}`, type: "function",
         function: { name: call.name, arguments: JSON.stringify(call.args) } }] }, "tool_calls");
@@ -122,15 +131,16 @@ it("searches and reads historical sessions through real OMP tools without extra 
   expect(conversationId).not.toBe("");
 
   expect(errors).toEqual([]);
-  // Exactly three main-model calls: search tool call, read tool call, final answer.
-  expect(requests).toHaveLength(3);
+  // Four tool calls plus the final answer; no indexing/search model calls.
+  expect(requests).toHaveLength(5);
   const sessionFile = manager.getSessionFile();
   expect(sessionFile).toBeDefined();
   const persisted = await loadSource(sessionFile!);
   const toolResults = persisted.entries.filter(entry => entry.role === "toolResult");
-  expect(toolResults).toHaveLength(2);
+  expect(toolResults).toHaveLength(4);
   const outputs = JSON.stringify(toolResults);
   expect(outputs).toContain("past-session");
+  expect(outputs).toContain("current-session");
   expect(outputs).toContain("WAL fsync failed");
   expect(outputs).not.toContain('"isError":true');
   const system = JSON.stringify(requests[0].messages[0]);

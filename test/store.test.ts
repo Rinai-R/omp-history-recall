@@ -44,6 +44,45 @@ function conversation(sessionId = "s1") {
   ];
 }
 
+function chain(count: number, text: (index: number) => string, prefix = "e") {
+  return Array.from({ length: count }, (_, index) => record("message", `${prefix}${index}`, index ? `${prefix}${index - 1}` : null, {
+    message: { role: index % 2 === 0 ? "user" : "assistant", content: text(index) },
+  }));
+}
+
+async function writeLive(file: string, sessionId: string, records: unknown[], root: string) {
+  const header = { type: "session", version: 3, id: sessionId, cwd: root, timestamp: "2026-09-20T00:00:00Z", title: "Live" };
+  await fs.writeFile(file, [header, ...records].map(value => JSON.stringify(value)).join("\n") + "\n");
+}
+
+async function setupLive(records: unknown[]) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "recall-live-")));
+  const sessionsRoot = path.join(root, "agent", "sessions");
+  const directory = path.join(sessionsRoot, "live");
+  await fs.mkdir(directory, { recursive: true });
+  const file = path.join(directory, "current.jsonl");
+  await writeLive(file, "live-session", records, root);
+  const scope: RecallScope = {
+    id: "scope_live", agentDir: path.join(root, "agent"),
+    sessionsRoot, customFilesRoot: path.join(root, "agent", "custom-session-files"),
+  };
+  const store = new HistoryStore(path.join(root, "index.db"), scope, {
+    activeSessionId: "live-session", activeFile: file, sessionDir: directory,
+  });
+  cleanup.push(async () => { store.close(); await fs.rm(root, { recursive: true, force: true }); });
+  return { root, file, store };
+}
+
+async function withLiveThreshold<T>(run: () => Promise<T>): Promise<T> {
+  const saved = process.env.OMP_HISTORY_RECALL_LIVE_INDEX_BYTES;
+  process.env.OMP_HISTORY_RECALL_LIVE_INDEX_BYTES = "65536";
+  try { return await run(); }
+  finally {
+    if (saved === undefined) delete process.env.OMP_HISTORY_RECALL_LIVE_INDEX_BYTES;
+    else process.env.OMP_HISTORY_RECALL_LIVE_INDEX_BYTES = saved;
+  }
+}
+
 describe("FTS session index", () => {
   it("ingests incrementally and searches original text without a model", async () => {
     const { root, sessionsRoot, store } = await setup();
@@ -204,6 +243,72 @@ describe("FTS session index", () => {
     await writeSession(path.join(sessionsRoot, "bulk"), "late", "late", root, conversation("late"));
     await expect(store.search(["WAL"], { limit: 25, cursor: first.next_cursor! }))
       .rejects.toMatchObject({ code: "stale_cursor" });
+  });
+
+  it("scans a small current session without building a live index", async () => {
+    const { store } = await setupLive(chain(20, index => `sandbox note ${index}`));
+    const result = await store.search(["sandbox"], { session_id: "live-session" });
+    expect(result).toMatchObject({ mode: "current-session", strategy: "scan" });
+    expect(result.matches?.[0]).toMatchObject({ entry_id: "e19", kind: "assistant" });
+    expect(store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM hr_live_files").get()!.n).toBe(0);
+  });
+
+  it("builds a live index once, skips unchanged files, and appends only new entries", async () => {
+    await withLiveThreshold(async () => {
+      const records = chain(120, index => `segment ${index} ${"x".repeat(700)}`);
+      const { file, root, store } = await setupLive(records);
+      const first = await store.search(["segment"], { session_id: "live-session" });
+      expect(first).toMatchObject({ mode: "current-session", strategy: "index" });
+      expect(first.matches!.length).toBeGreaterThan(0);
+      const meta = () => store.db.query<{ updated_at: string; indexed_lines: number; entry_count: number }, []>(
+        "SELECT updated_at,indexed_lines,entry_count FROM hr_live_files").get()!;
+      const changes = () => store.db.query<{ n: number }, []>("SELECT total_changes() AS n").get()!.n;
+      const before = meta();
+      const beforeChanges = changes();
+
+      const second = await store.search(["segment"], { session_id: "live-session" });
+      expect(second.strategy).toBe("index");
+      expect(meta()).toEqual(before);
+      expect(changes()).toBe(beforeChanges);
+
+      const appended = chain(3, index => `needle-${index} unique`, "n");
+      for (const entry of appended) entry.parentId = "e119";
+      await fs.appendFile(file, appended.map(value => JSON.stringify(value)).join("\n") + "\n");
+      const third = await store.search(["unique"], { session_id: "live-session" });
+      expect(third.matches?.map(match => match.entry_id)).toEqual(["n2", "n1", "n0"]);
+      const after = meta();
+      expect(after.entry_count).toBe(before.entry_count + 3);
+      expect(after.indexed_lines).toBeGreaterThan(before.indexed_lines);
+      expect(after.updated_at).not.toBe(before.updated_at);
+
+      await writeLive(file, "live-session", chain(2, index => `replacement ${index}`), root);
+      const rebuilt = await store.search(["unique"], { session_id: "live-session" });
+      expect(rebuilt.strategy).toBe("scan");
+      expect(rebuilt.matches).toEqual([]);
+      expect(store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM hr_live_files").get()!.n).toBe(0);
+    });
+  });
+
+  it("reads the newest entries of the current session by session id", async () => {
+    const { store } = await setupLive(chain(10, index => `recent ${index}`));
+    const page = await store.readConversation(undefined, { session_id: "live-session", last: 3 });
+    expect(page.fragments.map(fragment => fragment.entry_id)).toEqual(["e7", "e8", "e9"]);
+    await expect(store.readConversation(undefined, {
+      session_id: "live-session", last: 3, entry_id: "e9",
+    })).rejects.toMatchObject({ code: "invalid_context" });
+  });
+
+  it("filters global search and reads tails by session id", async () => {
+    const { root, sessionsRoot, store } = await setup();
+    await writeSession(path.join(sessionsRoot, "bucket-a"), "a", "a", root, chain(4, index => `alpha ${index}`, "a"));
+    await writeSession(path.join(sessionsRoot, "bucket-b"), "b", "b", root, chain(4, index => `alpha ${index}`, "b"));
+    await store.sync({ maxFiles: 10 });
+    const scoped = await store.search(["alpha"], { session_id: "a" });
+    expect(scoped.conversations.map(hit => hit.session_id)).toEqual(["a"]);
+    const conversationId = store.db.query<{ id: string }, [string]>(
+      "SELECT id FROM hr_conversations WHERE session_id=?").get("a")!.id;
+    const page = await store.readConversation(conversationId, { last: 2 });
+    expect(page.fragments.map(fragment => fragment.entry_id)).toEqual(["a2", "a3"]);
   });
 
   it("rejects incompatible derived databases with a rebuild instruction", async () => {

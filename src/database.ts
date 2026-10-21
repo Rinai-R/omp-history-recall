@@ -32,6 +32,22 @@ const SCHEMA = `
   PRAGMA user_version = 6;
 `;
 
+// Additive auxiliary tables for the current-session shadow index. Keeping these
+// out of the versioned schema means an existing global index stays valid.
+const LIVE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS hr_live_files (
+    session_id TEXT NOT NULL PRIMARY KEY,file TEXT NOT NULL,stamp TEXT NOT NULL,
+    indexed_size INTEGER NOT NULL,indexed_lines INTEGER NOT NULL,entry_count INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS hr_live_entries (
+    session_id TEXT NOT NULL,row_id TEXT NOT NULL,entry_id TEXT NOT NULL,line INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,kind TEXT NOT NULL,hash TEXT NOT NULL,text TEXT NOT NULL,
+    PRIMARY KEY(session_id,row_id)
+  );
+  CREATE VIRTUAL TABLE IF NOT EXISTS hr_live_search USING fts5(row_id UNINDEXED,session_id UNINDEXED,body);
+`;
+
 export function openHistoryDatabase(file: string): Database {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const db = new Database(file);
@@ -47,6 +63,7 @@ export function openHistoryDatabase(file: string): Database {
       }
       if (version === 0) db.run(SCHEMA);
     }).immediate();
+    db.exec(LIVE_SCHEMA);
     return db;
   } catch (error) {
     db.close();

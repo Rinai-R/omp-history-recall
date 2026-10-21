@@ -38,7 +38,7 @@ The equivalent full command is `omp plugin install omp-history-recall`. Restart 
 /history-recall status
 ```
 
-The agent gets `history_recall_search`, `history_recall_conversations` and `history_recall_read_conversation`. Search covers the active profile; pass `source_cwd` to restrict it to one working directory, and follow `next_cursor` to page through hits.
+The agent gets `history_recall_search`, `history_recall_conversations` and `history_recall_read_conversation`. Search covers the active profile; pass `source_cwd` to restrict it to one working directory, and follow `next_cursor` to page through hits. Pass `session_id` to target one session; the current session is read directly and gets a local index only when it is large. `last=N` returns a session's newest entries.
 
 Optional environment variables: `OMP_HISTORY_RECALL_DB` (index path), `OMP_HISTORY_RECALL_INGEST_FILES` (default 64), `OMP_HISTORY_RECALL_INGEST_BYTES` (default 32 MiB), `OMP_HISTORY_RECALL_DISABLED=1`.
 

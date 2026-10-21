@@ -140,6 +140,18 @@ function entryText(record: Record<string, unknown>): { role: string; text: strin
   return { role: "", text: "" };
 }
 
+// One tokenizer for global FTS bodies, query terms and live-session scans:
+// NFKC, lowercase, ASCII word tokens, and overlapping Han bigrams.
+export function lexicalTerms(text: string): string[] {
+  const normalized = text.normalize("NFKC").toLowerCase();
+  const values = [...normalized.matchAll(/[a-z0-9_]+|\p{Script=Han}+/gu)].flatMap(match => {
+    const word = match[0];
+    if (!/\p{Script=Han}/u.test(word)) return word.length > 1 ? [word] : [];
+    return word.length < 2 ? [word] : Array.from({ length: word.length - 1 }, (_, index) => word.slice(index, index + 2));
+  });
+  return [...new Set(values)];
+}
+
 export async function loadSource(
   file: string,
   options: { signal?: AbortSignal; maxBytes?: number } = {},
@@ -291,11 +303,19 @@ export function evidencePage(
 }
 
 export function readSourceEvidence(scopeId: string, source: SessionSource, options: {
-  entry_id?: string; before?: number; after?: number; cursor?: string; maxChars?: number;
+  entry_id?: string; before?: number; after?: number; last?: number; cursor?: string; maxChars?: number;
 } = {}): EvidencePage & { context?: { entry_id: string; before: number; after: number; alternate_children: string[] } } {
   const byId = new Map(source.entries.map(entry => [entry.id, entry]));
   let chain: SourceEntry[];
   let context: { entry_id: string; before: number; after: number; alternate_children: string[] } | undefined;
+  if (options.last !== undefined) {
+    if (options.entry_id !== undefined) {
+      throw new RecallError("invalid_context", "last cannot be combined with entry_id.");
+    }
+    if (!Number.isSafeInteger(options.last) || options.last < 1 || options.last > 200) {
+      throw new RecallError("invalid_context", "last must be an integer from 1 to 200.");
+    }
+  }
   if (options.entry_id !== undefined) {
     const before = options.before ?? 3;
     const after = options.after ?? 3;
@@ -331,6 +351,7 @@ export function readSourceEvidence(scopeId: string, source: SessionSource, optio
     const leaf = source.entries.at(-1);
     chain = [];
     for (let current: SourceEntry | undefined = leaf; current; current = current.parentId ? byId.get(current.parentId) : undefined) chain.unshift(current);
+    if (options.last !== undefined) chain = chain.slice(-options.last);
   }
   return { ...evidencePage(scopeId, source, chain.map(({ id, hash }) => ({ id, hash })), options), context };
 }
